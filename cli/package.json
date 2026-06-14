@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Agent-facing CLI for the elytro-core agent-native smart account: realized-value caps + guardian recovery, deterministic JSON for AI agents.",
   "type": "module",
-  "bin": { "elytro-agent": "./dist/elytro.js" },
+  "bin": { "elytro-agent": "dist/elytro.js" },
   "files": ["dist", "SKILL.md", "README.md", "FRIEND_SETUP.md"],
   "scripts": {
     "build": "node build.mjs",
@@ -13,7 +13,7 @@
   "engines": { "node": ">=18" },
   "keywords": ["elytro", "erc-4337", "smart-account", "agent", "wallet", "ai", "cli"],
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/Elytro-eth/elytro-core", "directory": "cli" },
+  "repository": { "type": "git", "url": "git+https://github.com/Elytro-eth/elytro-core.git", "directory": "cli" },
   "publishConfig": { "access": "public" },
   "dependencies": {
     "commander": "^13.0.0",
