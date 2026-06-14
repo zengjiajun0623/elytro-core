@@ -96,6 +96,9 @@ const FACTORY_ABI = [
 
 const ACCOUNT_ABI = [
   { type: 'function', name: 'owner', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'agents', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ name: 'active', type: 'bool' }, { name: 'notBefore', type: 'uint48' }, { name: 'expiresAt', type: 'uint48' }] },
+  { type: 'function', name: 'allowedCall', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'address' }, { type: 'bytes4' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'isProtected', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'bool' }] },
   { type: 'function', name: 'setProtectedToken', stateMutability: 'nonpayable', inputs: [{ type: 'address' }, { type: 'bool' }], outputs: [] },
   { type: 'function', name: 'setAgent', stateMutability: 'nonpayable', inputs: [{ type: 'address' }, { type: 'uint48' }, { type: 'uint48' }, { type: 'bool' }], outputs: [] },
   { type: 'function', name: 'setAllowedCall', stateMutability: 'nonpayable', inputs: [{ type: 'address' }, { type: 'address' }, { type: 'bytes4' }, { type: 'bool' }], outputs: [] },
@@ -152,8 +155,12 @@ const ACCOUNT_ERRORS = [
   { type: 'error', name: 'Error', inputs: [{ name: 'reason', type: 'string' }] },
   { type: 'error', name: 'Panic', inputs: [{ name: 'code', type: 'uint256' }] },
 ] as const;
-// Errors that mean "the agent hit its delegated ceiling" → escalate to human.
-const CAP_ERRORS = new Set(['PerTxCapExceeded', 'PerPeriodCapExceeded', 'TotalCapExceeded', 'UncappedProtectedAssetMoved']);
+// Errors the OWNER must resolve by changing the grant/config → escalate (-32010).
+// Everything else (funding, sick token) is an execution failure → -32012.
+const ESCALATE_ERRORS = new Set([
+  'PerTxCapExceeded', 'PerPeriodCapExceeded', 'TotalCapExceeded', 'UncappedProtectedAssetMoved',
+  'AgentExpired', 'AgentInactive', 'AgentNotYetValid', 'CallNotAllowlisted', 'UnprotectedTokenTransfer',
+]);
 function decodeRevert(data: Hex): { name: string; args: readonly unknown[] } | null {
   try {
     const d = decodeErrorResult({ abi: ACCOUNT_ERRORS, data });
@@ -272,26 +279,44 @@ common(program.command('grant'))
     ok({ status: 'granted', account: acct, agent, token, perTx: o.perTx, total: o.total, expiresAt, txs });
   });
 
-// check: would this action be authorized? (off-chain preflight)
+// check: would this action be authorized AND executable? Backed by a faithful
+// simulation of on-chain enforcement (cap incl. perPeriod, balance, allowlist,
+// expiry) — not pure arithmetic. Pass --to to also simulate the real transfer.
 common(program.command('check'))
   .requiredOption('--account <addr>')
   .requiredOption('--agent <addr>')
   .requiredOption('--token <addr>')
   .requiredOption('--amount <atomic>')
+  .option('--to <addr>', 'recipient (enables a real transfer simulation)')
   .action(async (o) => {
     const c = cfg(o);
-    const cap = await readCap(c, getAddress(o.account), getAddress(o.agent), getAddress(o.token));
-    const amount = BigInt(o.amount);
-    const reasons: string[] = [];
-    if (!cap.set) reasons.push('no cap for (agent, token)');
-    if (cap.perTx !== 0n && amount > cap.perTx) reasons.push(`amount ${amount} exceeds per-tx cap ${cap.perTx}`);
-    if (cap.total !== 0n && cap.spentTotal + amount > cap.total) reasons.push(`would exceed total cap ${cap.total} (spent ${cap.spentTotal})`);
-    const decision = reasons.length ? 'escalate' : 'allow';
+    const sim = await simulateSend(c, getAddress(o.account), getAddress(o.token), o.to ? getAddress(o.to) : undefined, BigInt(o.amount), getAddress(o.agent));
+    const decision = sim.decision === 'allow' ? 'allow' : 'escalate';
     ok({
-      decision, reasons: reasons.length ? reasons : ['within delegated envelope'],
-      cap: { perTx: cap.perTx, total: cap.total, spentTotal: cap.spentTotal },
-      hint: decision === 'allow' ? 'Agent may proceed without asking the human.' : 'Out of delegated scope — obtain human approval or have the human raise the grant.',
+      decision, predictedError: sim.predictedError, reasons: sim.reasons,
+      cap: sim.cap, headroom: sim.headroom, checks: sim.checks,
+      hint: decision === 'allow'
+        ? 'Agent may proceed without asking the human.'
+        : 'Out of delegated scope or not executable — obtain human approval, have the human adjust the grant, or fix funding.',
     });
+  });
+
+// simulate: dry-run a transfer end to end (what would move, would it revert,
+// remaining budget) WITHOUT broadcasting. The honest predictor for a
+// realized-value account. Agent defaults to the loaded session key.
+common(program.command('simulate'))
+  .requiredOption('--account <addr>')
+  .requiredOption('--token <addr>')
+  .requiredOption('--to <addr>')
+  .requiredOption('--amount <atomic>')
+  .option('--agent <addr>', 'agent address (defaults to the loaded session key)')
+  .action(async (o) => {
+    const c = cfg(o);
+    const acct = getAddress(o.account), token = getAddress(o.token), to = getAddress(o.to);
+    const agentAddr = o.agent ? getAddress(o.agent) : agentAccount(o).address;
+    const amount = BigInt(o.amount);
+    const sim = await simulateSend(c, acct, token, to, amount, agentAddr);
+    ok({ account: acct, agent: agentAddr, token, to, requested: amount, ...sim });
   });
 
 // send: agent acts — capped transfer via a UserOp through the EntryPoint
@@ -300,6 +325,7 @@ common(program.command('send'))
   .requiredOption('--token <addr>')
   .requiredOption('--to <addr>')
   .requiredOption('--amount <atomic>')
+  .option('--dry-run', 'simulate only; do not broadcast')
   .action(async (o) => {
     const c = cfg(o);
     const acct = getAddress(o.account), token = getAddress(o.token), to = getAddress(o.to);
@@ -310,13 +336,26 @@ common(program.command('send'))
     // the EntryPoint refunds to the beneficiary (the agent) below.
     const submitter = createWalletClient({ account: agent, chain: c.chain, transport: http(c.rpc) });
 
-    // preflight against the on-chain cap
-    const cap = await readCap(c, acct, agent.address, token);
-    if (!cap.set || (cap.perTx !== 0n && amount > cap.perTx) || (cap.total !== 0n && cap.spentTotal + amount > cap.total))
-      fail(-32010, 'Action is outside the agent delegated mandate.', {
-        decision: 'escalate', cap: { perTx: cap.perTx, total: cap.total, spentTotal: cap.spentTotal },
-        suggestion: 'Run `elytro-agent check` for detail, then get human approval or a larger grant.',
-      });
+    // Preflight via a faithful simulation (mirrors on-chain enforcement incl.
+    // perPeriod / balance / allowlist / expiry). Refuse BEFORE broadcasting so
+    // no gas is spent on an op the contract would reject. --dry-run stops here.
+    const sim = await simulateSend(c, acct, token, to, amount, agent.address);
+    if (o.dryRun) ok({ dryRun: true, account: acct, agent: agent.address, token, to, requested: amount, ...sim });
+    if (sim.decision === 'block') {
+      const name = sim.predictedError ?? 'UnknownRevert';
+      const isEscalate = ESCALATE_ERRORS.has(name);
+      fail(isEscalate ? -32010 : -32012,
+        isEscalate
+          ? `Action refused (${name}): outside the agent delegated mandate.`
+          : `Action would fail to execute (${name}).`,
+        {
+          decision: isEscalate ? 'escalate' : 'failed',
+          predictedError: name, reasons: sim.reasons, cap: sim.cap, headroom: sim.headroom, checks: sim.checks,
+          suggestion: isEscalate
+            ? 'Get human approval or have the human adjust the grant (elytro-agent grant ...).'
+            : 'Fix funding or the token issue; run `elytro-agent simulate` for detail. Not broadcast (no gas spent).',
+        });
+    }
 
     const innerCall = { target: token, value: 0n, data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'transfer', args: [to, amount] }) };
     const callData = encodeFunctionData({ abi: ACCOUNT_ABI, functionName: 'executeUserOp', args: [[innerCall]] });
@@ -355,18 +394,18 @@ common(program.command('send'))
       const raw = reasonLog ? (reasonLog.args.revertReason as Hex) : undefined;
       const decoded = raw && raw !== '0x' ? decodeRevert(raw) : null;
       const name = decoded?.name ?? 'UnknownRevert';
-      const isCap = CAP_ERRORS.has(name);
-      fail(isCap ? -32010 : -32012,
-        isCap
-          ? 'Action refused on-chain: outside the agent delegated mandate.'
+      const isEscalate = ESCALATE_ERRORS.has(name);
+      fail(isEscalate ? -32010 : -32012,
+        isEscalate
+          ? `Action refused on-chain (${name}): outside the agent delegated mandate.`
           : `Agent UserOp reverted on-chain (${name}).`,
         {
-          decision: isCap ? 'escalate' : 'failed',
+          decision: isEscalate ? 'escalate' : 'failed',
           reverted: { error: name, args: decoded?.args ?? [], raw: raw ?? null },
           txHash: hash, userOpHash, account: acct, agent: agent.address, token, to, requested: amount, moved,
-          suggestion: isCap
-            ? 'Get human approval or have the human raise the grant (elytro-agent grant ...).'
-            : 'The action is not permitted as constructed (allowlist, balance, expiry, or token behavior). Run `elytro-agent check` and inspect the error.',
+          suggestion: isEscalate
+            ? 'Get human approval or have the human adjust the grant (elytro-agent grant ...).'
+            : 'The action failed to execute (funding or token behavior). Run `elytro-agent simulate` and inspect the error.',
         });
     }
 
@@ -407,6 +446,88 @@ async function readCap(c: ReturnType<typeof cfg>, account: Address, agent: Addre
 }
 async function readBal(c: ReturnType<typeof cfg>, token: Address, who: Address) {
   return (await c.pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'balanceOf', args: [who] })) as bigint;
+}
+
+/// Faithful off-chain simulation of an agent `transfer` of a protected token,
+/// backed by real on-chain state + a real eth_call of the transfer. Mirrors the
+/// exact revert order of _execAsAgent + _charge so the predicted error matches
+/// what the contract would actually throw — closing the gaps the pure-arithmetic
+/// `check` missed (perPeriod window, account balance, allowlist, expiry).
+async function simulateSend(
+  c: ReturnType<typeof cfg>, acct: Address, token: Address, to: Address | undefined, amount: bigint, agentAddr: Address,
+) {
+  const [cap, agentTuple, allowlisted, protectedFlag, accountBal, block] = await Promise.all([
+    readCap(c, acct, agentAddr, token),
+    c.pub.readContract({ address: acct, abi: ACCOUNT_ABI, functionName: 'agents', args: [agentAddr] }) as Promise<readonly [boolean, number, number]>,
+    c.pub.readContract({ address: acct, abi: ACCOUNT_ABI, functionName: 'allowedCall', args: [agentAddr, token, TRANSFER_SELECTOR] }) as Promise<boolean>,
+    c.pub.readContract({ address: acct, abi: ACCOUNT_ABI, functionName: 'isProtected', args: [token] }) as Promise<boolean>,
+    readBal(c, token, acct),
+    c.pub.getBlock(),
+  ]);
+  const now = BigInt(block.timestamp);
+  const [active, notBefore, expiresAt] = agentTuple;
+
+  // Real token-level check: would the transfer itself succeed from the account?
+  // Catches paused/blacklist/non-standard reverts that arithmetic cannot see.
+  // Skipped when no recipient is given (a recipient-less `check` preflight).
+  let transferOk = true;
+  let transferRevert: string | null = null;
+  if (to) {
+    try {
+      await c.pub.call({ account: acct, to: token, data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'transfer', args: [to, amount] }) });
+    } catch (e) {
+      transferOk = false;
+      transferRevert = (e as Error).message?.split('\n')[0] ?? String(e);
+    }
+  }
+
+  // Replicate the rolling-window reset _charge applies before the perPeriod test.
+  const windowElapsed = cap.period !== 0n && now >= BigInt(cap.periodStart) + cap.period;
+  const effSpentPeriod = windowElapsed ? 0n : cap.spentPeriod;
+
+  // First blocker, in on-chain revert order. The predicted outflow for a plain
+  // ERC-20 transfer is `amount`; the contract charges the realized balance-delta,
+  // which equals `amount` for a standard token (fee-on-transfer would differ).
+  let error: string | null = null;
+  const reasons: string[] = [];
+  const add = (err: string, msg: string) => {
+    if (!error) error = err;
+    reasons.push(msg);
+  };
+
+  if (!active) add('AgentInactive', 'agent is not active for this account');
+  else {
+    if (now < BigInt(notBefore)) add('AgentNotYetValid', `agent not valid until unix ${notBefore}`);
+    if (now > BigInt(expiresAt)) add('AgentExpired', `agent grant expired at unix ${expiresAt}`);
+  }
+  if (!allowlisted) add('CallNotAllowlisted', 'transfer is not allowlisted for (agent, token)');
+  if (!protectedFlag) add('UnprotectedTokenTransfer', 'token is not in the protected (measured) set');
+  if (accountBal < amount) add('CallFailed', `account balance ${accountBal} < amount ${amount} (transfer would revert)`);
+  else if (!transferOk) add('CallFailed', `token transfer would revert: ${transferRevert}`);
+  if (!cap.set) add('UncappedProtectedAssetMoved', 'no cap set for (agent, token)');
+  else {
+    if (cap.perTx !== 0n && amount > cap.perTx) add('PerTxCapExceeded', `amount ${amount} exceeds per-tx cap ${cap.perTx}`);
+    if (cap.period !== 0n && cap.perPeriod !== 0n && effSpentPeriod + amount > cap.perPeriod)
+      add('PerPeriodCapExceeded', `would exceed per-period cap ${cap.perPeriod} (spent ${effSpentPeriod} this window)`);
+    if (cap.total !== 0n && cap.spentTotal + amount > cap.total)
+      add('TotalCapExceeded', `would exceed total cap ${cap.total} (spent ${cap.spentTotal})`);
+  }
+
+  const headroom = {
+    perTx: cap.perTx === 0n ? null : cap.perTx,
+    perPeriod: cap.period === 0n || cap.perPeriod === 0n ? null : (cap.perPeriod > effSpentPeriod ? cap.perPeriod - effSpentPeriod : 0n),
+    total: cap.total === 0n ? null : (cap.total > cap.spentTotal ? cap.total - cap.spentTotal : 0n),
+  };
+
+  const decision = error ? 'block' : 'allow';
+  return {
+    decision, predictedError: error,
+    willMove: decision === 'allow' ? amount : 0n,
+    reasons: reasons.length ? reasons : ['within delegated envelope and executable'],
+    checks: { agentActive: active, notBefore, expiresAt, allowlisted, protected: protectedFlag, accountBalance: accountBal, transferSimulated: Boolean(to), transferCallOk: transferOk, transferRevert },
+    cap: { set: cap.set, perTx: cap.perTx, perPeriod: cap.perPeriod, period: cap.period, total: cap.total, spentPeriod: cap.spentPeriod, effectiveSpentPeriod: effSpentPeriod, periodStart: cap.periodStart, spentTotal: cap.spentTotal },
+    headroom,
+  };
 }
 
 // keygen: generate + store this agent's session key (run once). The human

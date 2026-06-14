@@ -56,9 +56,10 @@ elytro-agent grant --account $ACCT --agent $AGENT --token $USDC \
 
 With **only** the agent key (no owner key in its environment):
 ```bash
-elytro-agent status --account $ACCT --agent $AGENT --token $USDC
-elytro-agent check  --account $ACCT --agent $AGENT --token $USDC --amount 50000000   # allow | escalate
-elytro-agent send   --account $ACCT --token $USDC --to 0xRecipient --amount 50000000
+elytro-agent status   --account $ACCT --agent $AGENT --token $USDC
+elytro-agent check    --account $ACCT --agent $AGENT --token $USDC --amount 50000000   # allow | escalate
+elytro-agent simulate --account $ACCT --token $USDC --to 0xRecipient --amount 50000000 # dry-run, no broadcast
+elytro-agent send     --account $ACCT --token $USDC --to 0xRecipient --amount 50000000
 ```
 - Within the cap → it just executes (no asking you).
 - Over the cap → it refuses (`-32010`) and asks you to approve or raise the grant.
