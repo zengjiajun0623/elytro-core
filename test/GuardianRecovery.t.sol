@@ -36,7 +36,7 @@ contract GuardianRecoveryTest is Test {
         gaddrs = new address[](3);
         for (uint256 i; i < 3; i++) gaddrs[i] = vm.addr(gpks[i]);
 
-        account = new AgentAccount(owner);
+        account = new AgentAccount(owner, address(0xE17240E1)); // EntryPoint unused here
         vm.deal(address(account), 10 ether);
 
         recovery = new GuardianRecovery(IRecoverable(address(account)), gaddrs, THRESHOLD, DELAY);

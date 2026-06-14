@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.28;
+
+import {IAccount, PackedUserOperation} from "./interfaces/IERC4337.sol";
 
 /**
  * @title AgentAccount
@@ -30,7 +32,7 @@ pragma solidity ^0.8.24;
  *     never grant ERC-20 allowances (no standing drain primitive), and is
  *     excluded from the ERC-1271 surface (no off-chain Permit/3009 bypass).
  */
-contract AgentAccount {
+contract AgentAccount is IAccount {
     // ─── Types ──────────────────────────────────────────────────────
 
     struct Call {
@@ -65,6 +67,7 @@ contract AgentAccount {
     bytes4 private constant TRANSFER_SEL = 0xa9059cbb; // transfer(address,uint256)
     bytes4 private constant ERC1271_MAGIC = 0x1626ba7e;
     bytes4 private constant ERC20_BALANCEOF = 0x70a08231; // balanceOf(address)
+    uint256 private constant SIG_VALIDATION_FAILED = 1; // ERC-4337 sentinel
 
     // Authorization-granting / pull selectors an agent may NEVER call. Selector
     // blocklists are open-ended by nature, so this is defense-in-depth on top of
@@ -82,9 +85,20 @@ contract AgentAccount {
 
     address public owner;
 
+    /// The ERC-4337 EntryPoint allowed to drive validateUserOp / executeUserOp.
+    address public immutable entryPoint;
+
     /// Authorized recovery module (a GuardianRecovery). The ONLY non-owner that
     /// may rotate the owner, and only via recoverOwner(). Set by root.
     address public recoveryModule;
+
+    // Transient operator hand-off between validateUserOp and executeUserOp within
+    // one tx. Transient storage auto-clears at tx end, so a failed/abandoned op
+    // never bricks the account across txs. _operatorPending guards against a
+    // second same-sender op in one bundle silently reusing the first's operator.
+    address private transient _operator;
+    bool private transient _operatorIsOwner;
+    bool private transient _operatorPending;
 
     mapping(address => Agent) public agents;
 
@@ -120,6 +134,9 @@ contract AgentAccount {
     error NotOwner();
     error NotOwnerOrSelf();
     error NotRecoveryModule();
+    error NotEntryPoint();
+    error NoOperator();
+    error OperatorPending();
     error Reentrancy();
     error AgentInactive();
     error AgentNotYetValid();
@@ -138,9 +155,10 @@ contract AgentAccount {
 
     // ─── Constructor ────────────────────────────────────────────────
 
-    constructor(address _owner) {
+    constructor(address _owner, address _entryPoint) {
         require(_owner != address(0), "owner=0");
         owner = _owner;
+        entryPoint = _entryPoint;
         emit OwnerSet(address(0), _owner);
     }
 
@@ -148,6 +166,11 @@ contract AgentAccount {
 
     modifier onlyOwnerOrSelf() {
         if (msg.sender != owner && msg.sender != address(this)) revert NotOwnerOrSelf();
+        _;
+    }
+
+    modifier onlyEntryPoint() {
+        if (msg.sender != entryPoint) revert NotEntryPoint();
         _;
     }
 
@@ -245,14 +268,77 @@ contract AgentAccount {
     // ─── Execution: root ────────────────────────────────────────────
 
     /// Root path: the human's cold key can do anything. No value checks.
-    function executeAsOwner(Call[] calldata calls) external nonReentrant returns (bytes[] memory results) {
+    function executeAsOwner(Call[] calldata calls) external nonReentrant returns (bytes[] memory) {
         if (msg.sender != owner) revert NotOwner();
+        return _execArbitrary(calls);
+    }
+
+    /// Unrestricted execution (root authority). No caps.
+    function _execArbitrary(Call[] calldata calls) internal returns (bytes[] memory results) {
         results = new bytes[](calls.length);
         for (uint256 i; i < calls.length; i++) {
             (bool ok, bytes memory ret) = calls[i].target.call{value: calls[i].value}(calls[i].data);
             if (!ok) revert CallFailed(i, ret);
             results[i] = ret;
         }
+    }
+
+    // ─── ERC-4337 (EntryPoint-driven) ───────────────────────────────
+
+    /**
+     * @notice Validate a UserOp for the EntryPoint. Stateless w.r.t. external
+     *         calls (ERC-7562-clean): recover the signer and classify it as the
+     *         owner (root) or an active agent. The capability + realized-value
+     *         enforcement happens later, in executeUserOp.
+     * @return validationData 0 (owner) | packed(validAfter,validUntil) (agent) |
+     *         SIG_VALIDATION_FAILED.
+     */
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, uint256 missingAccountFunds)
+        external
+        onlyEntryPoint
+        returns (uint256 validationData)
+    {
+        // Refuse to overwrite an operator that a prior op in this bundle has not
+        // yet consumed — prevents one op's authority being reused by another.
+        if (_operatorPending) revert OperatorPending();
+
+        address signer = _recover(userOpHash, userOp.signature);
+        if (signer != address(0) && signer == owner) {
+            _operatorIsOwner = true;
+            _operatorPending = true;
+            validationData = 0;
+        } else if (signer != address(0) && agents[signer].active) {
+            _operator = signer;
+            _operatorPending = true;
+            // EntryPoint enforces the time window from the packed validationData.
+            validationData = _packValidation(agents[signer].notBefore, agents[signer].expiresAt);
+        } else {
+            validationData = SIG_VALIDATION_FAILED;
+        }
+
+        if (missingAccountFunds > 0) {
+            (bool ok,) = payable(msg.sender).call{value: missingAccountFunds}("");
+            ok; // ignore; EntryPoint reverts on its own accounting if underpaid
+        }
+    }
+
+    /// Execution entry the EntryPoint calls. Applies the authority that
+    /// validateUserOp classified for this op (owner = unrestricted, agent =
+    /// capability + realized-value bounded).
+    function executeUserOp(Call[] calldata calls) external onlyEntryPoint nonReentrant returns (bytes[] memory) {
+        if (!_operatorPending) revert NoOperator();
+        bool isOwner = _operatorIsOwner;
+        address op = _operator;
+        _operatorPending = false;
+        _operatorIsOwner = false;
+        _operator = address(0);
+        return isOwner ? _execArbitrary(calls) : _execAsAgent(op, calls);
+    }
+
+    function _packValidation(uint48 validAfter, uint48 validUntil) internal pure returns (uint256) {
+        // ERC-4337 layout: authorizer(160) | validUntil(48) | validAfter(48).
+        // authorizer = 0 on success.
+        return (uint256(validAfter) << 208) | (uint256(validUntil) << 160);
     }
 
     // ─── Execution: agent (capability-bounded) ──────────────────────
@@ -263,8 +349,13 @@ contract AgentAccount {
      *      asset set — not by trusting calldata. A compromised agent cannot
      *      exceed its caps via any routing.
      */
-    function executeAsAgent(Call[] calldata calls) external nonReentrant returns (bytes[] memory results) {
-        address agent = msg.sender;
+    function executeAsAgent(Call[] calldata calls) external nonReentrant returns (bytes[] memory) {
+        return _execAsAgent(msg.sender, calls);
+    }
+
+    /// Capability + realized-value enforcement, shared by the direct path
+    /// (executeAsAgent) and the EntryPoint path (executeUserOp, agent-mode).
+    function _execAsAgent(address agent, Call[] calldata calls) internal returns (bytes[] memory results) {
         Agent memory a = agents[agent];
         if (!a.active) revert AgentInactive();
         if (block.timestamp < a.notBefore) revert AgentNotYetValid();
@@ -375,22 +466,26 @@ contract AgentAccount {
      *         would bypass every on-chain cap with zero on-chain footprint.
      */
     function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-        if (signature.length == 65) {
-            bytes32 r;
-            bytes32 s;
-            uint8 v;
-            assembly {
-                r := calldataload(signature.offset)
-                s := calldataload(add(signature.offset, 32))
-                v := byte(0, calldataload(add(signature.offset, 64)))
-            }
-            // reject high-s (EIP-2 malleability)
-            if (uint256(s) <= 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
-                address signer = ecrecover(hash, v, r, s);
-                if (signer != address(0) && signer == owner) return ERC1271_MAGIC;
-            }
+        address signer = _recover(hash, signature);
+        return (signer != address(0) && signer == owner) ? ERC1271_MAGIC : bytes4(0xffffffff);
+    }
+
+    /// 65-byte ECDSA recovery with EIP-2 low-s enforcement. Returns address(0)
+    /// on any malformed/high-s/invalid signature.
+    function _recover(bytes32 hash, bytes calldata signature) internal pure returns (address) {
+        if (signature.length != 65) return address(0);
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+            v := byte(0, calldataload(add(signature.offset, 64)))
         }
-        return 0xffffffff;
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return address(0);
+        }
+        return ecrecover(hash, v, r, s);
     }
 
     // ─── Views ──────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ contract AgentAccountTest is Test {
     function setUp() public {
         owner = vm.addr(ownerPk);
         agent = vm.addr(agentPk);
-        account = new AgentAccount(owner);
+        account = new AgentAccount(owner, address(0xE17240E1)); // EntryPoint unused on direct-call paths
         usdc = new MockERC20("USD Coin", "USDC");
         usdc.mint(address(account), 1000e18);
         vm.deal(address(account), 100 ether);
