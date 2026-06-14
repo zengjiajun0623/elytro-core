@@ -190,7 +190,7 @@ contract GuardianRecovery {
     }
 
     /// The active guardian set.
-    function guardians() external view returns (address[] memory) {
+    function getGuardians() external view returns (address[] memory) {
         return _guardianList;
     }
 
