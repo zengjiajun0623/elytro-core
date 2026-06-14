@@ -56,7 +56,12 @@ contract LifecycleTest is Test {
         //    address before the account even exists.
         bytes32 salt = bytes32(uint256(42));
         address predicted = factory.getAddress(owner, salt);
-        recovery = new GuardianRecovery(IRecoverable(predicted), gaddrs, 2, 2 days);
+        GuardianRecovery.GuardianSpec[] memory specs = new GuardianRecovery.GuardianSpec[](3);
+        specs[0] = GuardianRecovery.GuardianSpec(gaddrs[0], 1, 0);
+        specs[1] = GuardianRecovery.GuardianSpec(gaddrs[1], 1, 1);
+        specs[2] = GuardianRecovery.GuardianSpec(gaddrs[2], 1, 2);
+        // threshold 2 (weight), minClasses 2 — the rescue must span two categories.
+        recovery = new GuardianRecovery(IRecoverable(predicted), specs, 2, 2, 2 days);
 
         address acctAddr = factory.createAccount(owner, salt);
         assertEq(acctAddr, predicted, "counterfactual address mismatch");

@@ -39,9 +39,17 @@ contract GuardianRecoveryTest is Test {
         account = new AgentAccount(owner, address(0xE17240E1)); // EntryPoint unused here
         vm.deal(address(account), 10 ether);
 
-        recovery = new GuardianRecovery(IRecoverable(address(account)), gaddrs, THRESHOLD, DELAY);
+        recovery = new GuardianRecovery(IRecoverable(address(account)), _specs(gaddrs), THRESHOLD, 1, DELAY);
         vm.prank(owner);
         account.setRecoveryModule(address(recovery));
+    }
+
+    /// Build GuardianSpecs from sorted addresses: weight 1, distinct classes.
+    function _specs(address[] memory addrs) internal pure returns (GuardianRecovery.GuardianSpec[] memory specs) {
+        specs = new GuardianRecovery.GuardianSpec[](addrs.length);
+        for (uint256 i; i < addrs.length; i++) {
+            specs[i] = GuardianRecovery.GuardianSpec({addr: addrs[i], weight: 1, classId: uint8(i)});
+        }
     }
 
     // ── helpers ──────────────────────────────────────────────────
@@ -199,7 +207,7 @@ contract GuardianRecoveryTest is Test {
         ng[0] = gaddrs[1];
         ng[1] = gaddrs[2];
         vm.prank(owner);
-        recovery.setGuardians(ng, 2);
+        recovery.setGuardians(_specs(ng), 2, 1);
 
         assertFalse(recovery.isGuardian(dropped), "dropped guardian must be cleared");
         assertTrue(recovery.isGuardian(gaddrs[1]));
@@ -233,5 +241,61 @@ contract GuardianRecoveryTest is Test {
         vm.prank(owner);
         vm.expectRevert(GuardianRecovery.DelayTooLong.selector);
         recovery.setDelay(type(uint64).max);
+    }
+
+    // ── Weighted threshold ───────────────────────────────────────
+
+    function test_WeightedThreshold() public {
+        // g0:w1/c0, g1:w1/c1, g2:w3/c2 ; threshold 3, minClasses 1.
+        GuardianRecovery.GuardianSpec[] memory specs = new GuardianRecovery.GuardianSpec[](3);
+        specs[0] = GuardianRecovery.GuardianSpec(gaddrs[0], 1, 0);
+        specs[1] = GuardianRecovery.GuardianSpec(gaddrs[1], 1, 1);
+        specs[2] = GuardianRecovery.GuardianSpec(gaddrs[2], 3, 2);
+        GuardianRecovery rec = new GuardianRecovery(IRecoverable(address(account)), specs, 3, 1, DELAY);
+
+        // One heavy guardian (weight 3) alone meets the weight threshold.
+        bytes32 d = rec.recoveryDigest(rescuer);
+        bytes[] memory heavy = new bytes[](1);
+        heavy[0] = _sign(gpks[2], d);
+        rec.scheduleRecovery(rescuer, heavy);
+        (, , bool exists) = rec.pending();
+        assertTrue(exists, "heavy guardian should meet threshold");
+
+        // One light guardian (weight 1) cannot.
+        GuardianRecovery rec2 = new GuardianRecovery(IRecoverable(address(account)), specs, 3, 1, DELAY);
+        bytes32 d2 = rec2.recoveryDigest(rescuer);
+        bytes[] memory light = new bytes[](1);
+        light[0] = _sign(gpks[0], d2);
+        vm.expectRevert(abi.encodeWithSelector(GuardianRecovery.ThresholdNotMet.selector, uint256(1), uint256(3)));
+        rec2.scheduleRecovery(rescuer, light);
+    }
+
+    // ── Class diversity ──────────────────────────────────────────
+
+    function test_ClassDiversityRequired() public {
+        // g0:c0, g1:c0, g2:c1 ; threshold 2, minClasses 2 (one category can't reach it).
+        GuardianRecovery.GuardianSpec[] memory specs = new GuardianRecovery.GuardianSpec[](3);
+        specs[0] = GuardianRecovery.GuardianSpec(gaddrs[0], 1, 0);
+        specs[1] = GuardianRecovery.GuardianSpec(gaddrs[1], 1, 0);
+        specs[2] = GuardianRecovery.GuardianSpec(gaddrs[2], 1, 1);
+        GuardianRecovery rec = new GuardianRecovery(IRecoverable(address(account)), specs, 2, 2, DELAY);
+
+        // Two same-class guardians meet weight but not class diversity.
+        bytes32 d = rec.recoveryDigest(rescuer);
+        bytes[] memory sameClass = new bytes[](2);
+        sameClass[0] = _sign(gpks[0], d);
+        sameClass[1] = _sign(gpks[1], d);
+        vm.expectRevert(abi.encodeWithSelector(GuardianRecovery.ClassDiversityNotMet.selector, uint256(1), uint256(2)));
+        rec.scheduleRecovery(rescuer, sameClass);
+
+        // Two different-class guardians satisfy both.
+        GuardianRecovery rec2 = new GuardianRecovery(IRecoverable(address(account)), specs, 2, 2, DELAY);
+        bytes32 d2 = rec2.recoveryDigest(rescuer);
+        bytes[] memory crossClass = new bytes[](2);
+        crossClass[0] = _sign(gpks[0], d2); // class 0
+        crossClass[1] = _sign(gpks[2], d2); // class 1
+        rec2.scheduleRecovery(rescuer, crossClass);
+        (, , bool exists) = rec2.pending();
+        assertTrue(exists, "cross-class should satisfy diversity");
     }
 }

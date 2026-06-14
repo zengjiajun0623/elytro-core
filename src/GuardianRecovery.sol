@@ -12,20 +12,22 @@ interface IRecoverable {
  *
  * The recovery invariant: an agent can DRIVE recovery (assemble guardian
  * signatures off-chain and submit the permissionless on-chain txs) but can
- * never AUTHORIZE it — only a threshold of distinct guardians can, and only
- * after a time-delay during which the owner or any guardian may veto.
+ * never AUTHORIZE it — only guardians can, and only after a time-delay during
+ * which the owner or any guardian may veto.
  *
- *   schedule  → permissionless; requires >= threshold distinct guardian sigs
- *               over an EIP-712 digest binding the FULL params (account,
- *               newOwner, nonce, delay). Starts the delay clock.
- *   cancel    → owner OR any guardian; bumps the nonce, invalidating the
- *               scheduled recovery AND any collected signatures.
- *   execute   → permissionless after the delay; rotates the account owner.
- *
- * Guardians never give the agent their keys, so the agent is a courier, not an
- * authorizer. The delay + veto defeat a hijacked recovery to attacker keys.
+ * Guardians are WEIGHTED and CLASSED. A schedule requires both:
+ *   - total weight of distinct valid guardian signers >= `threshold`, AND
+ *   - the signers span >= `minClasses` distinct classes.
+ * So compromising one whole category (e.g. all of a user's agents, or all
+ * email guardians) cannot by itself reach threshold.
  */
 contract GuardianRecovery {
+    struct GuardianSpec {
+        address addr;
+        uint96 weight;
+        uint8 classId; // 0-255; e.g. 0=human EOA, 1=hardware, 2=agent, 3=email
+    }
+
     IRecoverable public immutable account;
 
     /// Upper bound on the recovery delay — guards against a units bug or an
@@ -33,14 +35,17 @@ contract GuardianRecovery {
     uint256 public constant MAX_DELAY = 365 days;
 
     mapping(address => bool) public isGuardian;
-    /// The active guardian set, kept explicitly so reconfiguration can CLEAR the
-    /// previous set (a removed guardian must lose all authority).
+    mapping(address => uint96) public guardianWeight;
+    mapping(address => uint8) public guardianClass;
     address[] private _guardianList;
-    uint256 public guardianCount;
+
+    /// Minimum total signer weight required to schedule a recovery.
     uint256 public threshold;
+    /// Minimum number of distinct guardian classes that must sign.
+    uint8 public minClasses;
     uint256 public delay;
 
-    /// Bumped on every cancel/execute to invalidate prior signatures (replay-safe).
+    /// Bumped on every cancel/execute/reconfig to invalidate prior signatures.
     uint256 public nonce;
 
     struct Pending {
@@ -55,7 +60,7 @@ contract GuardianRecovery {
     bytes32 public constant RECOVERY_TYPEHASH =
         keccak256("Recovery(address account,address newOwner,uint256 nonce,uint256 delay)");
 
-    event GuardiansSet(uint256 count, uint256 threshold);
+    event GuardiansSet(uint256 count, uint256 threshold, uint8 minClasses);
     event DelaySet(uint256 delay);
     event RecoveryScheduled(address indexed newOwner, uint256 executeAfter, uint256 nonce);
     event RecoveryCancelled(uint256 newNonce);
@@ -66,15 +71,23 @@ contract GuardianRecovery {
     error NoGuardians();
     error BadNewOwner();
     error SignersNotOrdered();
-    error ThresholdNotMet(uint256 got, uint256 need);
+    error ThresholdNotMet(uint256 gotWeight, uint256 needWeight);
+    error ClassDiversityNotMet(uint256 gotClasses, uint256 needClasses);
     error NothingScheduled();
     error DelayNotElapsed(uint256 nowTs, uint256 executeAfter);
     error AlreadyScheduled();
     error DelayTooLong();
+    error BadConfig();
 
-    constructor(IRecoverable _account, address[] memory guardians, uint256 _threshold, uint256 _delay) {
+    constructor(
+        IRecoverable _account,
+        GuardianSpec[] memory specs,
+        uint256 _threshold,
+        uint8 _minClasses,
+        uint256 _delay
+    ) {
         account = _account;
-        _setGuardians(guardians, _threshold);
+        _setGuardians(specs, _threshold, _minClasses);
         if (_delay > MAX_DELAY) revert DelayTooLong();
         delay = _delay;
         emit DelaySet(_delay);
@@ -96,8 +109,8 @@ contract GuardianRecovery {
 
     // ─── Root configuration ─────────────────────────────────────────
 
-    function setGuardians(address[] calldata guardians, uint256 _threshold) external onlyRoot {
-        _setGuardians(guardians, _threshold);
+    function setGuardians(GuardianSpec[] calldata specs, uint256 _threshold, uint8 _minClasses) external onlyRoot {
+        _setGuardians(specs, _threshold, _minClasses);
         _invalidate();
     }
 
@@ -110,7 +123,8 @@ contract GuardianRecovery {
 
     // ─── Recovery lifecycle ─────────────────────────────────────────
 
-    /// The EIP-712 digest guardians sign. Binds full params + current nonce.
+    /// The EIP-712 digest guardians sign. Binds full params + current nonce
+    /// (reconfiguring guardians/threshold/delay bumps the nonce, killing old sigs).
     function recoveryDigest(address newOwner) public view returns (bytes32) {
         bytes32 structHash = keccak256(abi.encode(RECOVERY_TYPEHASH, address(account), newOwner, nonce, delay));
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
@@ -118,33 +132,38 @@ contract GuardianRecovery {
 
     /**
      * @notice Schedule a recovery. Permissionless — anyone (the agent) may
-     *         submit, but only valid guardian signatures count.
+     *         submit, but only valid guardian signatures count toward the
+     *         weight threshold and class-diversity requirement.
      * @param signatures 65-byte ECDSA sigs, ordered by STRICTLY INCREASING
      *        signer address (guarantees distinct signers).
      */
     function scheduleRecovery(address newOwner, bytes[] calldata signatures) external {
         if (newOwner == address(0)) revert BadNewOwner();
         if (threshold == 0) revert NoGuardians();
-        // Must explicitly cancel an in-flight recovery before scheduling another;
-        // prevents a permissionless re-submit from resetting the delay clock.
         if (pending.exists) revert AlreadyScheduled();
 
         bytes32 d = recoveryDigest(newOwner);
         address last = address(0);
-        uint256 count;
+        uint256 weightSum;
+        uint256 classBits;
         for (uint256 i; i < signatures.length; i++) {
             address signer = _recover(d, signatures[i]);
             if (signer <= last) revert SignersNotOrdered();
             last = signer;
-            if (isGuardian[signer]) count++;
+            if (isGuardian[signer]) {
+                weightSum += guardianWeight[signer];
+                classBits |= (uint256(1) << guardianClass[signer]);
+            }
         }
-        if (count < threshold) revert ThresholdNotMet(count, threshold);
+        if (weightSum < threshold) revert ThresholdNotMet(weightSum, threshold);
+        uint256 classes = _popcount(classBits);
+        if (classes < minClasses) revert ClassDiversityNotMet(classes, minClasses);
 
         pending = Pending({newOwner: newOwner, executeAfter: uint64(block.timestamp + delay), exists: true});
         emit RecoveryScheduled(newOwner, block.timestamp + delay, nonce);
     }
 
-    /// Veto: the owner OR any guardian can cancel, invalidating collected sigs.
+    /// Veto: the owner OR any current guardian can cancel, invalidating sigs.
     function cancelRecovery() external {
         if (msg.sender != account.owner() && !isGuardian[msg.sender]) revert NotOwnerOrGuardian();
         _invalidate();
@@ -161,43 +180,69 @@ contract GuardianRecovery {
         emit RecoveryExecuted(newOwner);
     }
 
+    // ─── Views ──────────────────────────────────────────────────────
+
+    function getGuardians() external view returns (address[] memory) {
+        return _guardianList;
+    }
+
+    function guardianCount() external view returns (uint256) {
+        return _guardianList.length;
+    }
+
     // ─── Internals ──────────────────────────────────────────────────
 
-    function _setGuardians(address[] memory guardians, uint256 _threshold) internal {
-        uint256 n = guardians.length;
-        require(_threshold > 0 && _threshold <= n, "bad threshold");
+    function _setGuardians(GuardianSpec[] memory specs, uint256 _threshold, uint8 _minClasses) internal {
+        uint256 n = specs.length;
+        if (_threshold == 0 || _minClasses == 0 || n == 0) revert BadConfig();
 
         // Clear the PREVIOUS set first — a removed guardian must lose all
         // authority (it can otherwise still reach threshold or veto forever).
         uint256 oldLen = _guardianList.length;
         for (uint256 i; i < oldLen; i++) {
-            isGuardian[_guardianList[i]] = false;
+            address g = _guardianList[i];
+            isGuardian[g] = false;
+            guardianWeight[g] = 0;
+            guardianClass[g] = 0;
         }
         delete _guardianList;
 
         // Install the new set. Strictly ascending order guarantees distinctness.
         address last = address(0);
+        uint256 totalWeight;
+        uint256 classBits;
         for (uint256 i; i < n; i++) {
-            address g = guardians[i];
-            require(g > last, "guardians unordered/dup");
-            last = g;
-            isGuardian[g] = true;
-            _guardianList.push(g);
+            GuardianSpec memory g = specs[i];
+            require(g.addr > last, "guardians unordered/dup");
+            require(g.weight > 0, "zero weight");
+            last = g.addr;
+            isGuardian[g.addr] = true;
+            guardianWeight[g.addr] = g.weight;
+            guardianClass[g.addr] = g.classId;
+            _guardianList.push(g.addr);
+            totalWeight += g.weight;
+            classBits |= (uint256(1) << g.classId);
         }
-        guardianCount = n;
-        threshold = _threshold;
-        emit GuardiansSet(n, _threshold);
-    }
+        // The set must be able to satisfy its own rules.
+        if (totalWeight < _threshold) revert BadConfig();
+        if (_popcount(classBits) < _minClasses) revert BadConfig();
 
-    /// The active guardian set.
-    function getGuardians() external view returns (address[] memory) {
-        return _guardianList;
+        threshold = _threshold;
+        minClasses = _minClasses;
+        emit GuardiansSet(n, _threshold, _minClasses);
     }
 
     function _invalidate() internal {
         delete pending;
         unchecked {
             nonce++;
+        }
+    }
+
+    function _popcount(uint256 x) internal pure returns (uint256 c) {
+        while (x != 0) {
+            x &= (x - 1);
+            c++;
         }
     }
 
