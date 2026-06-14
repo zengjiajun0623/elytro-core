@@ -54,7 +54,7 @@ A successful owner rotation is total control, so the entire safety budget lives 
 
 ## Status
 
-✅ **49/49 tests pass** (`forge test`) — `AgentAccount` (24) + `GuardianRecovery` (13) + `ERC4337` (7) + `AgentAccountFactory` (4) + an end-to-end `Lifecycle` capstone (1).
+✅ **54/54 tests pass** (`forge test`) — `AgentAccount` (24) + `GuardianRecovery` (15, weighted + class-diverse) + `ERC4337` (7) + `AgentAccountFactory` (4) + an end-to-end `Lifecycle` capstone (1) + 3 fuzz **invariants** (128k calls each).
 
 The capstone ([`test/Lifecycle.t.sol`](test/Lifecycle.t.sol)) runs the whole story: counterfactual deploy → owner provisions an agent → agent operates via the EntryPoint within caps → over-cap UserOp refused → owner revokes → agent couriers guardian sigs to drive recovery → owner rotated → new owner operates.
 
@@ -74,14 +74,24 @@ A multi-agent adversarial red-team (4 attacker lenses → skeptic verification �
 | C6 | LOW | `scheduleRecovery` replay reset the delay clock | Block reschedule while pending |
 | U2 | LOW | Absurd delay could truncate (uint64) to the past | `MAX_DELAY` bound |
 
+### Invariant proof
+
+`test/Invariant.t.sol` fuzzes arbitrary agent action sequences (in-cap, over-cap, batches, inflow-masking attempts) and asserts, after every step: spend never exceeds the total cap, the amount moved exactly equals the amount charged (no value escapes accounting), and the recipient is bounded by the cap — **3 invariants × 128k calls each, 0 failures.**
+
 ### Remaining (by design / documented)
 - **Single-guardian veto** can grief recovery liveness (C7) — the deliberate veto tradeoff; harden with a veto quorum/cooldown later.
 - **Fixed-window period cap** allows ~2× across a boundary (C8); the lifetime `total` cap bounds the worst case. A sliding window is the upgrade.
 - **Compromised (not lost) owner key** can veto a guardian rescue — answered by step-up on high value, not yet built.
-- Not yet: passkey (P256/WebAuthn) root, a CREATE2 factory for counterfactual deploys, integration against the canonical EntryPoint, USD-denominated caps, weighted/class-diverse guardians.
+
+### Not yet (dependency / research / deploy-gated)
+- **Passkey (P256/WebAuthn) root** — needs the RIP-7212 precompile (or a vendored verifier) and test vectors `vm.sign` can't produce. The ECDSA owner already serves as cold root, so this is an upgrade, not a gap.
+- **Per-period gas / op-count budget** — windowed counters in `validateUserOp` violate ERC-7562 bundler rules (the blueprint's open problem); needs a stateless or off-critical-path design.
+- **USD-denominated caps** — needs a price oracle (blueprint open risk); caps are token-native today.
+- **Canonical EntryPoint integration + testnet deploy** — `script/Deploy.s.sol` is ready; the deploy itself is the outward-facing gate.
 
 ## Run
 
 ```bash
-forge test -vv
+forge test -vv          # 54 tests incl. invariants
+forge test --no-match-test invariant   # fast (skip fuzz)
 ```
