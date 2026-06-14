@@ -54,17 +54,16 @@ A successful owner rotation is total control, so the entire safety budget lives 
 
 ## Live on the Cleave testnet (real EntryPoint v0.8)
 
-Deployed and exercised on the Cleave testnet (anvil mainnet fork, chain `73571`) against the canonical EntryPoint v0.8 — the agent operating via real `handleOps`, not a mock:
+Deployed and exercised on the Cleave testnet (anvil mainnet fork, chain `73571`) against the canonical EntryPoint v0.8 — the agent operating via real `handleOps`, not a mock. Factory `0xd7D5f4A79c5042161324376F37Dd3Db7bd3E5C2F`; agent account `0x57871B921a9868A067E722Df6C2Dd0e81EDBA91C`.
 
-| Item | Value |
-|---|---|
-| Factory | `0xd7D5f4A79c5042161324376F37Dd3Db7bd3E5C2F` |
-| Agent account | `0x57871B921a9868A067E722Df6C2Dd0e81EDBA91C` |
-| Cap | per-tx 100, total 300 (TUSD) |
-| **In-cap** transfer (50) | tx `0x3233e704…65a` → **executed**, bob +50, account 1000→950, `spentTotal`=50 |
-| **Over-cap** transfer (150) | tx `0xb3aafb62…259` → op **refused** (`PerTxCapExceeded(…,150,100)`), `success=false`, **no value moved** |
+| Live scenario | Result | Tx |
+|---|---|---|
+| Agent **in-cap** transfer, 50 mock TUSD (cap 100) | ✅ executed; bob +50, account 1000→950, `spentTotal`=50 | `0x3233e704…65a` |
+| Agent **over-cap** transfer, 150 (> cap 100) | 🛑 refused on-chain (`PerTxCapExceeded(…,150,100)`), `success=false`, **no value moved** | `0xb3aafb62…259` |
+| Agent **in-cap** transfer, **50 REAL mainnet USDC** (`0xA0b8…eB48`) | ✅ executed; bob +50 USDC, account 10,000→9,950 USDC | `0xf9c55eb9…4bc` |
+| **Agent-driven recovery** (agent couriers 2 cross-class guardian sigs) | ✅ owner rotated on-chain `0xa0Ee…9720` → `0x9965…A4dc`; agent cannot forge sigs | account `0x12Eb…198b` |
 
-The realized-value cap held end-to-end on a live chain through the genuine EntryPoint. Harness: `script/CleaveE2E.s.sol` (deploy + provision) and `script/BuildOp.s.sol` (build/sign an agent UserOp → submit via `cast send`).
+The realized-value cap held end-to-end on a live chain through the genuine EntryPoint — with real USDC — and an agent drove a guardian recovery without being able to authorize it. Harness: `script/CleaveE2E.s.sol` (deploy + provision), `script/BuildOp.s.sol` (build/sign a UserOp → `cast send`), `script/CleaveRecovery.s.sol` (live recovery).
 
 ## Status
 
