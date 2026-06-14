@@ -17,6 +17,8 @@ import {
   http,
   defineChain,
   encodeFunctionData,
+  decodeErrorResult,
+  parseEventLogs,
   keccak256,
   toHex,
   toBytes,
@@ -116,7 +118,50 @@ const ENTRYPOINT_ABI = [
   { type: 'function', name: 'getNonce', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'uint192' }], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'getUserOpHash', stateMutability: 'view', inputs: [USEROP_TUPLE], outputs: [{ type: 'bytes32' }] },
   { type: 'function', name: 'handleOps', stateMutability: 'nonpayable', inputs: [{ ...USEROP_TUPLE, type: 'tuple[]' }, { type: 'address' }], outputs: [] },
+  // The EntryPoint catches inner UserOp reverts and STILL mines the bundle, so
+  // these events (not the tx receipt status) are the authoritative outcome.
+  { type: 'event', name: 'UserOperationEvent', inputs: [
+    { name: 'userOpHash', type: 'bytes32', indexed: true }, { name: 'sender', type: 'address', indexed: true },
+    { name: 'paymaster', type: 'address', indexed: true }, { name: 'nonce', type: 'uint256', indexed: false },
+    { name: 'success', type: 'bool', indexed: false }, { name: 'actualGasCost', type: 'uint256', indexed: false },
+    { name: 'actualGasUsed', type: 'uint256', indexed: false },
+  ] },
+  { type: 'event', name: 'UserOperationRevertReason', inputs: [
+    { name: 'userOpHash', type: 'bytes32', indexed: true }, { name: 'sender', type: 'address', indexed: true },
+    { name: 'nonce', type: 'uint256', indexed: false }, { name: 'revertReason', type: 'bytes', indexed: false },
+  ] },
 ] as const;
+
+// AgentAccount custom errors, used to decode an inner UserOp revert reason into
+// a meaningful agent-facing code. (Plus the Solidity built-ins.)
+const ACCOUNT_ERRORS = [
+  { type: 'error', name: 'AgentInactive', inputs: [] },
+  { type: 'error', name: 'AgentNotYetValid', inputs: [] },
+  { type: 'error', name: 'AgentExpired', inputs: [] },
+  { type: 'error', name: 'SelfCallForbidden', inputs: [] },
+  { type: 'error', name: 'ApprovalForbidden', inputs: [] },
+  { type: 'error', name: 'MalformedCalldata', inputs: [] },
+  { type: 'error', name: 'UnprotectedTokenTransfer', inputs: [{ name: 'token', type: 'address' }] },
+  { type: 'error', name: 'CallNotAllowlisted', inputs: [{ name: 'target', type: 'address' }, { name: 'selector', type: 'bytes4' }] },
+  { type: 'error', name: 'CallFailed', inputs: [{ name: 'index', type: 'uint256' }, { name: 'ret', type: 'bytes' }] },
+  { type: 'error', name: 'UncappedProtectedAssetMoved', inputs: [{ name: 'asset', type: 'address' }] },
+  { type: 'error', name: 'PerTxCapExceeded', inputs: [{ name: 'asset', type: 'address' }, { name: 'outflow', type: 'uint256' }, { name: 'cap', type: 'uint256' }] },
+  { type: 'error', name: 'PerPeriodCapExceeded', inputs: [{ name: 'asset', type: 'address' }, { name: 'wouldSpend', type: 'uint256' }, { name: 'cap', type: 'uint256' }] },
+  { type: 'error', name: 'TotalCapExceeded', inputs: [{ name: 'asset', type: 'address' }, { name: 'wouldSpend', type: 'uint256' }, { name: 'cap', type: 'uint256' }] },
+  { type: 'error', name: 'BalanceQueryFailed', inputs: [{ name: 'token', type: 'address' }] },
+  { type: 'error', name: 'Error', inputs: [{ name: 'reason', type: 'string' }] },
+  { type: 'error', name: 'Panic', inputs: [{ name: 'code', type: 'uint256' }] },
+] as const;
+// Errors that mean "the agent hit its delegated ceiling" → escalate to human.
+const CAP_ERRORS = new Set(['PerTxCapExceeded', 'PerPeriodCapExceeded', 'TotalCapExceeded', 'UncappedProtectedAssetMoved']);
+function decodeRevert(data: Hex): { name: string; args: readonly unknown[] } | null {
+  try {
+    const d = decodeErrorResult({ abi: ACCOUNT_ERRORS, data });
+    return { name: d.errorName, args: (d.args ?? []) as readonly unknown[] };
+  } catch {
+    return null;
+  }
+}
 
 const ERC20_ABI = [
   { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
@@ -294,10 +339,46 @@ common(program.command('send'))
     const r = await c.pub.waitForTransactionReceipt({ hash });
     const balAfter = await readBal(c, token, to);
     const moved = balAfter - balBefore;
+
+    // handleOps mines successfully even when the inner UserOp reverts (the
+    // EntryPoint catches inner reverts), so r.status is NOT the outcome. The
+    // authoritative signal is UserOperationEvent.success for our userOpHash.
+    const want = (userOpHash as Hex).toLowerCase();
+    const opEvent = parseEventLogs({ abi: ENTRYPOINT_ABI, eventName: 'UserOperationEvent', logs: r.logs })
+      .find((e) => (e.args.userOpHash as Hex).toLowerCase() === want);
+    const opSuccess = opEvent ? Boolean(opEvent.args.success) : undefined;
+
+    if (opSuccess === false) {
+      // Decode WHY the contract refused, so the agent can branch deterministically.
+      const reasonLog = parseEventLogs({ abi: ENTRYPOINT_ABI, eventName: 'UserOperationRevertReason', logs: r.logs })
+        .find((e) => (e.args.userOpHash as Hex).toLowerCase() === want);
+      const raw = reasonLog ? (reasonLog.args.revertReason as Hex) : undefined;
+      const decoded = raw && raw !== '0x' ? decodeRevert(raw) : null;
+      const name = decoded?.name ?? 'UnknownRevert';
+      const isCap = CAP_ERRORS.has(name);
+      fail(isCap ? -32010 : -32012,
+        isCap
+          ? 'Action refused on-chain: outside the agent delegated mandate.'
+          : `Agent UserOp reverted on-chain (${name}).`,
+        {
+          decision: isCap ? 'escalate' : 'failed',
+          reverted: { error: name, args: decoded?.args ?? [], raw: raw ?? null },
+          txHash: hash, userOpHash, account: acct, agent: agent.address, token, to, requested: amount, moved,
+          suggestion: isCap
+            ? 'Get human approval or have the human raise the grant (elytro-agent grant ...).'
+            : 'The action is not permitted as constructed (allowlist, balance, expiry, or token behavior). Run `elytro-agent check` and inspect the error.',
+        });
+    }
+
     ok({
-      status: r.status, txHash: hash, userOpHash, account: acct, agent: agent.address, token, to,
-      requested: amount, moved, executed: moved === amount,
-      note: moved === amount ? 'Capped transfer executed autonomously within the human-delegated envelope.' : 'UserOp included but moved 0 — likely reverted on a cap (the contract refused).',
+      status: r.status, userOpSuccess: opSuccess ?? null, txHash: hash, userOpHash,
+      account: acct, agent: agent.address, token, to,
+      requested: amount, moved, executed: opSuccess === true && moved === amount,
+      note: opSuccess === undefined
+        ? `Could not find UserOperationEvent in the receipt; verify on-chain (moved ${moved}).`
+        : moved === amount
+          ? 'Capped transfer executed autonomously within the human-delegated envelope.'
+          : `UserOp succeeded on-chain but recipient delta (${moved}) differs from requested (${amount}); likely a fee-on-transfer or rebasing token.`,
     });
   });
 
