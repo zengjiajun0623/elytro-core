@@ -54,9 +54,11 @@ A successful owner rotation is total control, so the entire safety budget lives 
 
 ## Status
 
-✅ **44/44 tests pass** (`forge test`) — `AgentAccount` (24) + `GuardianRecovery` (13) + `ERC4337` (7).
+✅ **49/49 tests pass** (`forge test`) — `AgentAccount` (24) + `GuardianRecovery` (13) + `ERC4337` (7) + `AgentAccountFactory` (4) + an end-to-end `Lifecycle` capstone (1).
 
-This is the on-chain core (blueprint Phases 1 + 3 + 4337 surface): caps and recovery that hold even if every off-chain Elytro service is gone.
+The capstone ([`test/Lifecycle.t.sol`](test/Lifecycle.t.sol)) runs the whole story: counterfactual deploy → owner provisions an agent → agent operates via the EntryPoint within caps → over-cap UserOp refused → owner revokes → agent couriers guardian sigs to drive recovery → owner rotated → new owner operates.
+
+This is the on-chain core (blueprint Phases 1 + 3 + the 4337 surface + a deploy factory): caps and recovery that hold even if every off-chain Elytro service is gone.
 
 ### Security review
 
