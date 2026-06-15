@@ -764,6 +764,178 @@ common(program.command('dapp'))
     });
   });
 
+// ─── WalletConnect / EIP-1193 bridge ─────────────────────────────
+// The "drop a dApp page" fallback: let a dApp FRONTEND drive the agent's smart
+// account over WalletConnect v2 when reconstructing calldata directly isn't
+// practical. EVERY request is mapped to a BOUNDED agent action — transactions
+// route through the realized-value-capped agent paths; a standing approval is
+// REFUSED (only the atomic JIT rail may approve, so no lasting allowance forms);
+// signing escalates to the owner until bounded login-signing ships. The router
+// below is the security-critical brain and is exercised by `--simulate-request`.
+const WC_FORBIDDEN_SELECTORS = new Set<string>([
+  '0x095ea7b3', '0x39509351', '0xa22cb465', '0xd505accf', '0x8fcbaf0c', '0x87517c45', '0x23b872dd',
+]);
+const APPROVE_SEL_HEX = '0x095ea7b3';
+function selectorOf(data: string | undefined): string {
+  return data && data.length >= 10 ? data.slice(0, 10).toLowerCase() : '0x';
+}
+// Field name MUST be `target` (not `to`): the AgentAccount Call tuple names its
+// first component `target`, and viem encodes tuple objects by component name.
+type RoutedCall = { target: Address; value: bigint; data: Hex };
+type Routed =
+  | { kind: 'reply'; result: unknown }
+  | { kind: 'escalate'; reason: string }
+  | { kind: 'tx'; calls: RoutedCall[] }
+  | { kind: 'jit'; spender: Address; token: Address; amount: bigint; calls: RoutedCall[] };
+
+function routeWcRequest(method: string, params: any[], account: Address, chainId: number): Routed {
+  const norm = (c: any): RoutedCall => ({ target: getAddress(c.to), value: BigInt(c.value ?? 0), data: (c.data ?? '0x') as Hex });
+  switch (method) {
+    case 'eth_accounts':
+    case 'eth_requestAccounts':
+      return { kind: 'reply', result: [account] };
+    case 'eth_chainId':
+      return { kind: 'reply', result: '0x' + chainId.toString(16) };
+    case 'personal_sign':
+    case 'eth_sign':
+    case 'eth_signTypedData':
+    case 'eth_signTypedData_v4':
+      return { kind: 'escalate', reason: `signing (${method}) requires the owner until bounded login-signing ships` };
+    case 'eth_sendTransaction': {
+      const tx = params?.[0] ?? {};
+      const sel = selectorOf(tx.data);
+      if (WC_FORBIDDEN_SELECTORS.has(sel)) {
+        return { kind: 'escalate', reason: `standing approval/permit (${sel}) refused: a bounded agent cannot grant a lasting allowance. Have the dApp send an atomic batch (wallet_sendCalls [approve, action]) so the JIT rail applies.` };
+      }
+      return { kind: 'tx', calls: [norm(tx)] };
+    }
+    case 'wallet_sendCalls': {
+      const req = params?.[0] ?? {};
+      const calls: RoutedCall[] = (req.calls ?? []).map(norm);
+      // A leading approve paired with its action → rewrite to the JIT rail (atomic
+      // approve+reset). Any OTHER forbidden selector in the batch is refused.
+      if (calls.length >= 2 && selectorOf(calls[0].data) === APPROVE_SEL_HEX) {
+        const d = calls[0].data;
+        const spender = getAddress(('0x' + d.slice(34, 74)) as Hex);
+        const amount = BigInt(('0x' + d.slice(74, 138)) as Hex);
+        return { kind: 'jit', spender, token: calls[0].target, amount, calls: calls.slice(1) };
+      }
+      for (const cc of calls) {
+        if (WC_FORBIDDEN_SELECTORS.has(selectorOf(cc.data))) {
+          return { kind: 'escalate', reason: `batch contains a forbidden approval/permit (${selectorOf(cc.data)}); only a leading approve paired with its action (JIT) is allowed` };
+        }
+      }
+      return { kind: 'tx', calls };
+    }
+    default:
+      return { kind: 'escalate', reason: `unsupported method ${method}` };
+  }
+}
+
+async function simulateRouted(c: ReturnType<typeof cfg>, acct: Address, agentAddr: Address, routed: Routed) {
+  const fn = routed.kind === 'jit' ? 'executeAsAgentJIT' : 'executeAsAgent';
+  const args = routed.kind === 'jit' ? [routed.spender, routed.token, routed.amount, (routed as any).calls] : [(routed as any).calls];
+  try {
+    await c.pub.simulateContract({ address: acct, abi: DAPP_SIM_ABI, functionName: fn, args, account: agentAddr });
+    return { decision: 'allow' as const, predictedError: null as string | null };
+  } catch (e) {
+    const rev = (e as BaseError).walk?.((x) => x instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | undefined;
+    return { decision: 'block' as const, predictedError: rev?.data?.errorName ?? rev?.reason ?? 'UnknownRevert' };
+  }
+}
+
+// connect: WalletConnect bridge. --simulate-request tests routing with no relay;
+// a wc: URI pairs live (needs WC_PROJECT_ID + the @reown/walletkit dep).
+common(program.command('connect'))
+  .description('Bridge a dApp frontend to the bounded agent wallet over WalletConnect v2')
+  .argument('[uri]', 'WalletConnect pairing URI (wc:...) for a live session')
+  .requiredOption('--account <addr>')
+  .option('--simulate-request <json>', 'route one JSON {method,params} request (no relay, no broadcast)')
+  .option('--project-id <id>', 'WalletConnect project id (or env WC_PROJECT_ID)')
+  .action(async (uri: string | undefined, o: Record<string, string | undefined>) => {
+    const c = cfg(o);
+    const acct = getAddress(o.account!);
+    const agent = agentAccount(o);
+
+    // SIMULATE: exercise the router + the bounded preflight, no relay/broadcast.
+    if (o.simulateRequest) {
+      let reqObj: any;
+      try { reqObj = JSON.parse(o.simulateRequest); } catch { fail(-32602, 'bad --simulate-request JSON'); }
+      const routed = routeWcRequest(reqObj.method, reqObj.params ?? [], acct, c.chain.id);
+      if (routed.kind === 'reply') ok({ request: reqObj.method, routed: 'reply', result: routed.result });
+      if (routed.kind === 'escalate') ok({ request: reqObj.method, routed: 'escalate', decision: 'escalate', reason: routed.reason });
+      const sim = await simulateRouted(c, acct, agent.address, routed);
+      ok({
+        request: reqObj.method, routed: routed.kind, decision: sim.decision, predictedError: sim.predictedError,
+        plan: routed.kind === 'jit'
+          ? { rail: 'executeAsAgentJIT', jitSpender: routed.spender, jitToken: routed.token, jitAmount: routed.amount, calls: routed.calls }
+          : { rail: 'executeAsAgent', calls: (routed as any).calls },
+        note: 'Routed a dApp request to a bounded agent action. No relay, no broadcast.',
+      });
+    }
+
+    // LIVE: pair over the WalletConnect relay. Beta — needs a project id + the SDK.
+    if (!uri) fail(-32602, 'Provide a wc: pairing URI for a live session, or use --simulate-request to test routing.');
+    const projectId = o.projectId || process.env.WC_PROJECT_ID;
+    if (!projectId) fail(-32001, 'No WalletConnect project id. Get a free one at https://cloud.reown.com, then pass --project-id or set WC_PROJECT_ID.');
+    let WalletKit: any, Core: any, wcUtils: any;
+    try {
+      ({ WalletKit } = await import('@reown/walletkit'));
+      ({ Core } = await import('@walletconnect/core'));
+      wcUtils = await import('@walletconnect/utils');
+    } catch {
+      fail(-32001, 'WalletConnect SDK not installed. Run: npm i @reown/walletkit @walletconnect/core @walletconnect/utils');
+    }
+    const eip155 = `eip155:${c.chain.id}`;
+    const core = new Core({ projectId });
+    const kit = await WalletKit.init({ core, metadata: { name: 'Elytro Agent', description: 'Bounded agent wallet', url: 'https://elytro.com', icons: [] } });
+    const submitter = createWalletClient({ account: agent, chain: c.chain, transport: http(c.rpc) });
+
+    kit.on('session_proposal', async ({ id, params }: any) => {
+      try {
+        const namespaces = wcUtils.buildApprovedNamespaces({
+          proposal: params,
+          supportedNamespaces: {
+            eip155: {
+              chains: [eip155],
+              methods: ['eth_sendTransaction', 'wallet_sendCalls', 'eth_accounts', 'eth_chainId', 'personal_sign', 'eth_signTypedData', 'eth_signTypedData_v4'],
+              events: ['accountsChanged', 'chainChanged'],
+              accounts: [`${eip155}:${acct}`],
+            },
+          },
+        });
+        const session = await kit.approveSession({ id, namespaces });
+        process.stderr.write(JSON.stringify({ event: 'session_approved', topic: session.topic }) + '\n');
+      } catch (e) {
+        await kit.rejectSession({ id, reason: wcUtils.getSdkError('USER_REJECTED') });
+      }
+    });
+
+    kit.on('session_request', async ({ topic, id, params }: any) => {
+      const method = params.request.method;
+      const routed = routeWcRequest(method, params.request.params ?? [], acct, c.chain.id);
+      const respond = (result: unknown) => kit.respondSessionRequest({ topic, response: { id, jsonrpc: '2.0', result } });
+      const reject = (message: string) => kit.respondSessionRequest({ topic, response: { id, jsonrpc: '2.0', error: { code: -32010, message } } });
+      try {
+        if (routed.kind === 'reply') return respond(routed.result);
+        if (routed.kind === 'escalate') { process.stderr.write(JSON.stringify({ event: 'escalate', method, reason: routed.reason }) + '\n'); return reject(routed.reason); }
+        const sim = await simulateRouted(c, acct, agent.address, routed);
+        if (sim.decision === 'block') { process.stderr.write(JSON.stringify({ event: 'refused', method, predictedError: sim.predictedError }) + '\n'); return reject(`refused on cap/policy: ${sim.predictedError}`); }
+        const fn = routed.kind === 'jit' ? 'executeAsAgentJIT' : 'executeAsAgent';
+        const args = routed.kind === 'jit' ? [routed.spender, routed.token, routed.amount, routed.calls] : [routed.calls];
+        const hash = await submitter.writeContract({ address: acct, abi: AGENT_EXEC_ABI, functionName: fn, args: args as any, gas: 3000000n, gasPrice: await legacyGas(c) });
+        process.stderr.write(JSON.stringify({ event: 'executed', method, txHash: hash }) + '\n');
+        return respond(hash);
+      } catch (e) {
+        return reject(`bridge error: ${(e as Error).message?.split('\n')[0] ?? 'unknown'}`);
+      }
+    });
+
+    await kit.pair({ uri });
+    process.stderr.write(JSON.stringify({ event: 'paired', account: acct, chain: c.chain.id }) + '\n');
+    await new Promise(() => {}); // stay alive, serving session requests
+  });
+
 // status: account + agent + balances
 common(program.command('status'))
   .requiredOption('--account <addr>')
