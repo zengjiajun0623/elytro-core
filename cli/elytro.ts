@@ -24,6 +24,8 @@ import {
   toBytes,
   isAddress,
   getAddress,
+  BaseError,
+  ContractFunctionRevertedError,
   type Address,
   type Hex,
 } from 'viem';
@@ -38,6 +40,10 @@ const TRANSFER_SELECTOR = '0xa9059cbb' as Hex;
 // out of the box; override any of them with env vars or flags.
 const CLEAVE_RPC = 'https://foundry-production-85dd.up.railway.app';
 const CLEAVE_FACTORY = '0xd7D5f4A79c5042161324376F37Dd3Db7bd3E5C2F' as Address;
+// Cleave Earn (P / yield leg) testnet defaults for the `earn` verb — override with flags.
+const CLEAVE_ZAP = '0x889f96D66d7E396d60309F3E151e08a91eEdEe25' as Address;
+const CLEAVE_SERIES = '0x9f1ac54BEF0DD2f6f3462EA0fa94fC62300d3a8e' as Address;
+const CLEAVE_USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' as Address;
 const KEY_DIR = join(homedir(), '.elytro-agent');
 const KEY_FILE = join(KEY_DIR, 'agent.key');
 
@@ -176,6 +182,33 @@ const ERC20_ABI = [
   { type: 'function', name: 'decimals', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] },
   { type: 'function', name: 'symbol', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
 ] as const;
+
+// Cleave Zap (Earn leg): yieldBuy pulls quote (USDC) from the account via a
+// standing owner-set allowance and routes it through Uniswap to mint P to the
+// account. The realized-value engine charges the MEASURED USDC outflow against
+// the agent's cap — so the agent is bounded even though a router moves the value.
+const ZAP_ABI = [
+  { type: 'function', name: 'yieldBuy', stateMutability: 'nonpayable',
+    inputs: [{ name: 'series', type: 'address' }, { name: 'poolFee', type: 'uint24' }, { name: 'quoteIn', type: 'uint256' }, { name: 'minPOut', type: 'uint256' }, { name: 'deadline', type: 'uint256' }],
+    outputs: [{ name: 'pOut', type: 'uint256' }] },
+  // boostFull buys the upside (N) leg with NATIVE ETH (payable) — no approve
+  // needed. The realized-value engine charges the measured native-ETH outflow
+  // (value sent − ethBack) against the agent's native (address(0)) cap.
+  { type: 'function', name: 'boostFull', stateMutability: 'payable',
+    inputs: [{ name: 'series', type: 'address' }, { name: 'poolFee', type: 'uint24' }, { name: 'wethFee', type: 'uint24' }, { name: 'rounds', type: 'uint256' }, { name: 'minNOut', type: 'uint256' }, { name: 'deadline', type: 'uint256' }],
+    outputs: [{ name: 'nOut', type: 'uint256' }, { name: 'ethBack', type: 'uint256' }] },
+] as const;
+const SERIES_ABI = [
+  { type: 'function', name: 'P', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'N', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+] as const;
+const NATIVE_ASSET = '0x0000000000000000000000000000000000000000' as Address;
+// Faithful `earn` preflight: eth_call the DIRECT agent path with the account's
+// custom errors in-ABI so viem decodes a revert into the exact error name.
+const EXEC_AGENT_ABI = [
+  { type: 'function', name: 'executeAsAgent', stateMutability: 'nonpayable', inputs: [CALL_TUPLE], outputs: [{ type: 'bytes[]' }] },
+] as const;
+const SIM_ABI = [...EXEC_AGENT_ABI, ...ACCOUNT_ERRORS] as const;
 
 // ─── config ──────────────────────────────────────────────────────
 function cfg(opts: Record<string, string | undefined>) {
@@ -418,6 +451,233 @@ common(program.command('send'))
         : moved === amount
           ? 'Capped transfer executed autonomously within the human-delegated envelope.'
           : `UserOp succeeded on-chain but recipient delta (${moved}) differs from requested (${amount}); likely a fee-on-transfer or rebasing token.`,
+    });
+  });
+
+// earn: agent buys the Cleave Earn (P / yield) leg via the Zap's yieldBuy,
+// bounded by the SAME realized-value cap. The engine charges the account's
+// measured USDC outflow even though a Uniswap router moves it (`transferFrom`
+// under a standing owner-set allowance). Requires the owner to have, ONCE:
+//   executeAsOwner([USDC.approve(zap, X)])  AND  setAllowedCall(agent, zap, yieldBuy).
+// The agent never approves and never holds the owner key.
+common(program.command('earn'))
+  .description('Buy the Cleave Earn (P/yield) leg via the Zap, bounded by the realized-value USDC cap')
+  .requiredOption('--account <addr>')
+  .requiredOption('--amount <atomic>', 'USDC to spend (6 decimals)')
+  .option('--zap <addr>', 'Cleave Zap', CLEAVE_ZAP)
+  .option('--series <addr>', 'Cleave series', CLEAVE_SERIES)
+  .option('--usdc <addr>', 'quote token', CLEAVE_USDC)
+  .option('--pool-fee <fee>', 'USDC/P pool fee tier', '10000')
+  .option('--min-out <atomic>', 'minimum P out (slippage floor)', '0')
+  .option('--deadline <unix>', 'deadline (unix seconds)')
+  .option('--dry-run', 'simulate only; do not broadcast')
+  .action(async (o) => {
+    const c = cfg(o);
+    const acct = getAddress(o.account), zap = getAddress(o.zap), series = getAddress(o.series), usdc = getAddress(o.usdc);
+    const amount = BigInt(o.amount), poolFee = Number(o.poolFee), minOut = BigInt(o.minOut);
+    const deadline = o.deadline ? BigInt(o.deadline) : BigInt(Math.floor(Date.now() / 1000) + 600);
+    const agent = agentAccount(o);
+    const innerCall = {
+      target: zap, value: 0n,
+      data: encodeFunctionData({ abi: ZAP_ABI, functionName: 'yieldBuy', args: [series, poolFee, amount, minOut, deadline] }),
+    };
+
+    // Faithful preflight: eth_call the REAL agent path (allowlist + forbidden
+    // surface + realized-value charge) AND the live Uniswap swap. It reverts
+    // exactly as the contract would on-chain; viem decodes the custom error.
+    const cap = await readCap(c, acct, agent.address, usdc);
+    let predictedError: string | null = null;
+    try {
+      await c.pub.simulateContract({ address: acct, abi: SIM_ABI, functionName: 'executeAsAgent', args: [[innerCall]], account: agent.address });
+    } catch (e) {
+      const rev = (e as BaseError).walk?.((x) => x instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | undefined;
+      predictedError = rev?.data?.errorName ?? rev?.reason ?? 'UnknownRevert';
+    }
+    const decision = predictedError ? 'block' : 'allow';
+    const headroom = {
+      perTx: cap.perTx === 0n ? null : cap.perTx,
+      total: cap.total === 0n ? null : (cap.total > cap.spentTotal ? cap.total - cap.spentTotal : 0n),
+    };
+
+    if (decision === 'block') {
+      const isEscalate = ESCALATE_ERRORS.has(predictedError!);
+      if (o.dryRun) ok({ dryRun: true, decision, predictedError, account: acct, agent: agent.address, zap, series, usdc, willSpend: 0n, headroom });
+      fail(isEscalate ? -32010 : -32012,
+        isEscalate ? `Earn refused (${predictedError}): outside the agent delegated mandate.` : `Earn would fail to execute (${predictedError}).`,
+        { decision: isEscalate ? 'escalate' : 'failed', predictedError, cap, headroom,
+          suggestion: isEscalate
+            ? 'Get human approval or have the human adjust the grant (elytro-agent grant ...).'
+            : 'Check account USDC funding, the Zap allowance, or widen --min-out slippage. Not broadcast (no gas spent).' });
+    }
+    if (o.dryRun) ok({ dryRun: true, decision, predictedError: null, account: acct, agent: agent.address, zap, series, usdc, willSpend: amount, headroom });
+
+    // Execute via the EntryPoint (same machinery as `send`): the agent signs its
+    // own UserOp and submits it (acts as bundler), so it never needs the owner key.
+    const pToken = await c.pub.readContract({ address: series, abi: SERIES_ABI, functionName: 'P' }) as Address;
+    const usdcBefore = await readBal(c, usdc, acct);
+    const pBefore = await readBal(c, pToken, acct);
+    const callData = encodeFunctionData({ abi: ACCOUNT_ABI, functionName: 'executeUserOp', args: [[innerCall]] });
+    const nonce = await c.pub.readContract({ address: c.entryPoint, abi: ENTRYPOINT_ABI, functionName: 'getNonce', args: [acct, 0n] });
+    const op = {
+      sender: acct, nonce, initCode: '0x' as Hex, callData,
+      accountGasLimits: pack128(500000n, 1200000n), preVerificationGas: 100000n,
+      gasFees: pack128(1000000000n, (await legacyGas(c)) * 2n + 1000000000n),
+      paymasterAndData: '0x' as Hex, signature: '0x' as Hex,
+    };
+    const userOpHash = await c.pub.readContract({ address: c.entryPoint, abi: ENTRYPOINT_ABI, functionName: 'getUserOpHash', args: [op] });
+    op.signature = await agent.sign({ hash: userOpHash });
+    const submitter = createWalletClient({ account: agent, chain: c.chain, transport: http(c.rpc) });
+    const hash = await submitter.writeContract({
+      address: c.entryPoint, abi: ENTRYPOINT_ABI, functionName: 'handleOps',
+      args: [[op], submitter.account!.address], gas: 3500000n, gasPrice: await legacyGas(c),
+    });
+    const r = await c.pub.waitForTransactionReceipt({ hash });
+    const want = (userOpHash as Hex).toLowerCase();
+    const opEvent = parseEventLogs({ abi: ENTRYPOINT_ABI, eventName: 'UserOperationEvent', logs: r.logs })
+      .find((e) => (e.args.userOpHash as Hex).toLowerCase() === want);
+    const opSuccess = opEvent ? Boolean(opEvent.args.success) : undefined;
+
+    const usdcAfter = await readBal(c, usdc, acct);
+    const pAfter = await readBal(c, pToken, acct);
+    const usdcSpent = usdcBefore > usdcAfter ? usdcBefore - usdcAfter : 0n;
+    const pReceived = pAfter > pBefore ? pAfter - pBefore : 0n;
+
+    if (opSuccess === false) {
+      const reasonLog = parseEventLogs({ abi: ENTRYPOINT_ABI, eventName: 'UserOperationRevertReason', logs: r.logs })
+        .find((e) => (e.args.userOpHash as Hex).toLowerCase() === want);
+      const raw = reasonLog ? (reasonLog.args.revertReason as Hex) : undefined;
+      const decoded = raw && raw !== '0x' ? decodeRevert(raw) : null;
+      const name = decoded?.name ?? 'UnknownRevert';
+      const isEscalate = ESCALATE_ERRORS.has(name);
+      fail(isEscalate ? -32010 : -32012,
+        isEscalate ? `Earn refused on-chain (${name}): outside the agent delegated mandate.` : `Earn UserOp reverted on-chain (${name}).`,
+        { decision: isEscalate ? 'escalate' : 'failed', reverted: { error: name, args: decoded?.args ?? [], raw: raw ?? null },
+          txHash: hash, userOpHash, account: acct, agent: agent.address, zap, series, usdc, requested: amount, usdcSpent, pReceived,
+          suggestion: isEscalate
+            ? 'Get human approval or have the human adjust the grant (elytro-agent grant ...).'
+            : 'Check funding/allowance/slippage; run `elytro-agent earn --dry-run` to inspect.' });
+    }
+
+    ok({
+      status: r.status, userOpSuccess: opSuccess ?? null, txHash: hash, userOpHash,
+      account: acct, agent: agent.address, zap, series, pToken, usdc,
+      requested: amount, usdcSpent, pReceived,
+      executed: opSuccess === true && usdcSpent > 0n && pReceived > 0n,
+      note: opSuccess === undefined
+        ? `Could not find UserOperationEvent; verify on-chain (USDC spent ${usdcSpent}, P received ${pReceived}).`
+        : 'Earn (P) bought autonomously within the human-delegated realized-value cap; USDC outflow charged against the cap.',
+    });
+  });
+
+// boost: agent buys the Cleave Boost (N / upside) leg via the Zap's boostFull,
+// a PAYABLE native-ETH call (no approve needed). Bounded by the agent's native
+// (address(0)) cap — the engine charges the measured ETH outflow (value − ethBack).
+// Owner must, once: setAllowedCall(agent, zap, boostFull) AND setCap on native.
+common(program.command('boost'))
+  .description('Buy the Cleave Boost (N/upside) leg via the Zap, bounded by the realized-value native-ETH cap')
+  .requiredOption('--account <addr>')
+  .requiredOption('--amount <wei>', 'native ETH to spend (18 decimals)')
+  .option('--zap <addr>', 'Cleave Zap', CLEAVE_ZAP)
+  .option('--series <addr>', 'Cleave series', CLEAVE_SERIES)
+  .option('--pool-fee <fee>', 'P/USDC pool fee tier', '10000')
+  .option('--weth-fee <fee>', 'ETH/WETH-leg fee tier', '500')
+  .option('--rounds <n>', 'leverage rounds', '12')
+  .option('--min-out <atomic>', 'minimum N out (slippage floor)', '0')
+  .option('--deadline <unix>', 'deadline (unix seconds)')
+  .option('--dry-run', 'simulate only; do not broadcast')
+  .action(async (o) => {
+    const c = cfg(o);
+    const acct = getAddress(o.account), zap = getAddress(o.zap), series = getAddress(o.series);
+    const amount = BigInt(o.amount), poolFee = Number(o.poolFee), wethFee = Number(o.wethFee), rounds = BigInt(o.rounds), minOut = BigInt(o.minOut);
+    const deadline = o.deadline ? BigInt(o.deadline) : BigInt(Math.floor(Date.now() / 1000) + 600);
+    const agent = agentAccount(o);
+    const innerCall = {
+      target: zap, value: amount,
+      data: encodeFunctionData({ abi: ZAP_ABI, functionName: 'boostFull', args: [series, poolFee, wethFee, rounds, minOut, deadline] }),
+    };
+
+    // Faithful preflight: eth_call the REAL agent path (allowlist + native-cap
+    // realized-value charge) AND the live boost route. Reverts as on-chain would.
+    const cap = await readCap(c, acct, agent.address, NATIVE_ASSET);
+    let predictedError: string | null = null;
+    try {
+      await c.pub.simulateContract({ address: acct, abi: SIM_ABI, functionName: 'executeAsAgent', args: [[innerCall]], account: agent.address });
+    } catch (e) {
+      const rev = (e as BaseError).walk?.((x) => x instanceof ContractFunctionRevertedError) as ContractFunctionRevertedError | undefined;
+      predictedError = rev?.data?.errorName ?? rev?.reason ?? 'UnknownRevert';
+    }
+    const decision = predictedError ? 'block' : 'allow';
+    const headroom = {
+      perTx: cap.perTx === 0n ? null : cap.perTx,
+      total: cap.total === 0n ? null : (cap.total > cap.spentTotal ? cap.total - cap.spentTotal : 0n),
+    };
+
+    if (decision === 'block') {
+      const isEscalate = ESCALATE_ERRORS.has(predictedError!);
+      if (o.dryRun) ok({ dryRun: true, decision, predictedError, account: acct, agent: agent.address, zap, series, willSpend: 0n, headroom });
+      fail(isEscalate ? -32010 : -32012,
+        isEscalate ? `Boost refused (${predictedError}): outside the agent delegated mandate.` : `Boost would fail to execute (${predictedError}).`,
+        { decision: isEscalate ? 'escalate' : 'failed', predictedError, cap, headroom,
+          suggestion: isEscalate
+            ? 'Get human approval or have the human adjust the native-ETH grant (setCap on address(0)).'
+            : 'Check account ETH funding or widen --min-out slippage. Not broadcast (no gas spent).' });
+    }
+    if (o.dryRun) ok({ dryRun: true, decision, predictedError: null, account: acct, agent: agent.address, zap, series, willSpend: amount, headroom });
+
+    // Execute via the EntryPoint, same path as `send`/`earn`.
+    const nToken = await c.pub.readContract({ address: series, abi: SERIES_ABI, functionName: 'N' }) as Address;
+    const nBefore = await readBal(c, nToken, acct);
+    const spentBefore = (await readCap(c, acct, agent.address, NATIVE_ASSET)).spentTotal;
+    const callData = encodeFunctionData({ abi: ACCOUNT_ABI, functionName: 'executeUserOp', args: [[innerCall]] });
+    const nonce = await c.pub.readContract({ address: c.entryPoint, abi: ENTRYPOINT_ABI, functionName: 'getNonce', args: [acct, 0n] });
+    const op = {
+      sender: acct, nonce, initCode: '0x' as Hex, callData,
+      accountGasLimits: pack128(600000n, 4000000n), preVerificationGas: 200000n,
+      gasFees: pack128(1000000000n, (await legacyGas(c)) * 2n + 1000000000n),
+      paymasterAndData: '0x' as Hex, signature: '0x' as Hex,
+    };
+    const userOpHash = await c.pub.readContract({ address: c.entryPoint, abi: ENTRYPOINT_ABI, functionName: 'getUserOpHash', args: [op] });
+    op.signature = await agent.sign({ hash: userOpHash });
+    const submitter = createWalletClient({ account: agent, chain: c.chain, transport: http(c.rpc) });
+    const hash = await submitter.writeContract({
+      address: c.entryPoint, abi: ENTRYPOINT_ABI, functionName: 'handleOps',
+      args: [[op], submitter.account!.address], gas: 7000000n, gasPrice: await legacyGas(c),
+    });
+    const r = await c.pub.waitForTransactionReceipt({ hash });
+    const want = (userOpHash as Hex).toLowerCase();
+    const opEvent = parseEventLogs({ abi: ENTRYPOINT_ABI, eventName: 'UserOperationEvent', logs: r.logs })
+      .find((e) => (e.args.userOpHash as Hex).toLowerCase() === want);
+    const opSuccess = opEvent ? Boolean(opEvent.args.success) : undefined;
+
+    const nAfter = await readBal(c, nToken, acct);
+    const spentAfter = (await readCap(c, acct, agent.address, NATIVE_ASSET)).spentTotal;
+    const ethSpent = spentAfter > spentBefore ? spentAfter - spentBefore : 0n; // realized native outflow charged to the cap
+    const nReceived = nAfter > nBefore ? nAfter - nBefore : 0n;
+
+    if (opSuccess === false) {
+      const reasonLog = parseEventLogs({ abi: ENTRYPOINT_ABI, eventName: 'UserOperationRevertReason', logs: r.logs })
+        .find((e) => (e.args.userOpHash as Hex).toLowerCase() === want);
+      const raw = reasonLog ? (reasonLog.args.revertReason as Hex) : undefined;
+      const decoded = raw && raw !== '0x' ? decodeRevert(raw) : null;
+      const name = decoded?.name ?? 'UnknownRevert';
+      const isEscalate = ESCALATE_ERRORS.has(name);
+      fail(isEscalate ? -32010 : -32012,
+        isEscalate ? `Boost refused on-chain (${name}): outside the agent delegated mandate.` : `Boost UserOp reverted on-chain (${name}).`,
+        { decision: isEscalate ? 'escalate' : 'failed', reverted: { error: name, args: decoded?.args ?? [], raw: raw ?? null },
+          txHash: hash, userOpHash, account: acct, agent: agent.address, zap, series, requested: amount, ethSpent, nReceived,
+          suggestion: isEscalate
+            ? 'Get human approval or have the human adjust the native-ETH grant (setCap on address(0)).'
+            : 'Check funding/slippage; run `elytro-agent boost --dry-run` to inspect.' });
+    }
+
+    ok({
+      status: r.status, userOpSuccess: opSuccess ?? null, txHash: hash, userOpHash,
+      account: acct, agent: agent.address, zap, series, nToken,
+      requested: amount, ethSpent, nReceived,
+      executed: opSuccess === true && ethSpent > 0n && nReceived > 0n,
+      note: opSuccess === undefined
+        ? `Could not find UserOperationEvent; verify on-chain (ETH spent ${ethSpent}, N received ${nReceived}).`
+        : 'Boost (N) bought autonomously within the human-delegated native-ETH cap; ETH outflow charged against the cap.',
     });
   });
 
