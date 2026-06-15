@@ -98,6 +98,26 @@ contract AgentAccount is IAccount {
     bytes4 private constant ERC4626_REDEEM_SEL = 0xba087652; // redeem(uint256,address,address)
     bytes4 private constant WETH_WITHDRAW_SEL = 0x2e1a7d4d; // withdraw(uint256)
     bytes4 private constant ALLOWANCE_SELECTOR = 0xdd62ed3e; // allowance(address,address)
+    // Value-authorizing EIP-712 primaryType hashes an agent may NEVER sign (these
+    // move value off-chain with no on-chain footprint). Defense-in-depth on top of
+    // the approved-domain bound (a value type lives on a token/Permit2 domain the
+    // owner never approves anyway).
+    bytes32 private constant PERMIT_TYPEHASH =
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+    bytes32 private constant DAI_PERMIT_TYPEHASH =
+        keccak256("Permit(address holder,address spender,uint256 nonce,uint256 expiry,bool allowed)");
+    bytes32 private constant TRANSFER_WITH_AUTH_TYPEHASH = keccak256(
+        "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+    );
+    bytes32 private constant RECEIVE_WITH_AUTH_TYPEHASH = keccak256(
+        "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+    );
+    bytes32 private constant PERMIT2_TRANSFER_FROM_TYPEHASH = keccak256(
+        "PermitTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline)TokenPermissions(address token,uint256 amount)"
+    );
+    bytes32 private constant PERMIT2_SINGLE_TYPEHASH = keccak256(
+        "PermitSingle(PermitDetails details,address spender,uint256 sigDeadline)PermitDetails(address token,uint160 amount,uint48 expiration,uint48 nonce)"
+    );
 
     // ─── Storage ────────────────────────────────────────────────────
 
@@ -142,6 +162,14 @@ contract AgentAccount is IAccount {
     /// slot layout (and the Lean-proven _charge accounting it sits beside).
     mapping(address => bool) public openMode;
 
+    /// agent => may produce BOUNDED ERC-1271 signatures (login / typed-data on an
+    /// owner-approved domain). Off by default. The agent can never produce a
+    /// value-authorizing signature; see isValidSignature.
+    mapping(address => bool) public agentCanSign;
+    /// EIP-712 domainSeparators the owner approved for agent signing. Approve ONLY
+    /// login/session app domains, NEVER a token or Permit2 domain: that is the bound.
+    mapping(bytes32 => bool) public approvedSignDomain;
+
     // ─── Events ─────────────────────────────────────────────────────
 
     event OwnerSet(address indexed previous, address indexed current);
@@ -154,6 +182,8 @@ contract AgentAccount is IAccount {
     event AgentExecuted(address indexed agent, uint256 calls);
     event Outflow(address indexed agent, address indexed asset, uint256 amount);
     event OpenModeSet(address indexed agent, bool on);
+    event AgentCanSignSet(address indexed agent, bool on);
+    event ApprovedSignDomainSet(bytes32 indexed domainSeparator, bool on);
 
     // ─── Errors ─────────────────────────────────────────────────────
 
@@ -262,6 +292,22 @@ contract AgentAccount is IAccount {
         require(agent != address(0) && agent != owner, "bad agent");
         openMode[agent] = on;
         emit OpenModeSet(agent, on);
+    }
+
+    /// Let an agent produce BOUNDED ERC-1271 signatures (login/typed-data). The
+    /// agent can sign only on owner-approved domains and never a value-authorizing
+    /// message; see isValidSignature. Off by default.
+    function setAgentCanSign(address agent, bool on) external onlyOwnerOrSelf {
+        require(agent != address(0) && agent != owner, "bad agent");
+        agentCanSign[agent] = on;
+        emit AgentCanSignSet(agent, on);
+    }
+
+    /// Approve an EIP-712 domainSeparator the agent may sign for. Approve ONLY a
+    /// login/session app domain; NEVER a token (Permit) or Permit2 domain.
+    function setApprovedSignDomain(bytes32 domainSeparator, bool on) external onlyOwnerOrSelf {
+        approvedSignDomain[domainSeparator] = on;
+        emit ApprovedSignDomainSet(domainSeparator, on);
     }
 
     function setCap(
@@ -583,16 +629,52 @@ contract AgentAccount is IAccount {
         return (true, abi.decode(data, (uint256)));
     }
 
-    // ─── ERC-1271 (owner-only) ──────────────────────────────────────
+    // ─── ERC-1271 ───────────────────────────────────────────────────
 
     /**
-     * @notice Owner-only signature validation. Agents are deliberately EXCLUDED:
-     *         an agent that could sign off-chain (Permit, Permit2, EIP-3009)
-     *         would bypass every on-chain cap with zero on-chain footprint.
+     * @notice Signature validation.
+     *  - OWNER: unrestricted, over a plain 65-byte ECDSA signature.
+     *  - AGENT (bounded login signing): a 256-byte structured blob carrying the
+     *    EIP-712 envelope, so the contract proves ON-CHAIN what was signed:
+     *      [0:32] domainSeparator | [32:64] structHash | [64:96] primaryTypeHash | [160:225] 65-byte sig
+     *    Valid ONLY when the recomputed EIP-712 digest equals `hash`, the domain is
+     *    owner-approved, the type is NOT value-authorizing, and the signer is an
+     *    active agent with agentCanSign. So a compromised agent can prove a login on
+     *    an approved app but can NEVER produce a value-moving signature: Permit /
+     *    Permit2 / EIP-3009 live on a token/Permit2 domain the owner never approves,
+     *    AND their typehashes are explicitly blocklisted even on an approved domain.
+     *    Opaque personal_sign / eth_sign (a bare 65-byte sig) stays OWNER-ONLY,
+     *    because its preimage cannot be inspected on-chain.
      */
     function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-        address signer = _recover(hash, signature);
-        return (signer != address(0) && signer == owner) ? ERC1271_MAGIC : bytes4(0xffffffff);
+        if (signature.length == 65) {
+            address s = _recover(hash, signature);
+            return (s != address(0) && s == owner) ? ERC1271_MAGIC : bytes4(0xffffffff);
+        }
+        if (signature.length == 256) {
+            bytes32 domSep;
+            bytes32 structHash;
+            bytes32 typeHash;
+            assembly {
+                domSep := calldataload(signature.offset)
+                structHash := calldataload(add(signature.offset, 32))
+                typeHash := calldataload(add(signature.offset, 64))
+            }
+            // Bind the supplied envelope to the queried hash: prove it IS this exact
+            // EIP-712 (domain, struct). Then enforce the agent's signing bounds.
+            if (keccak256(abi.encodePacked("\x19\x01", domSep, structHash)) != hash) return bytes4(0xffffffff);
+            if (!approvedSignDomain[domSep]) return bytes4(0xffffffff);
+            if (_isValueAuthTypehash(typeHash)) return bytes4(0xffffffff);
+            address s = _recover(hash, signature[160:225]);
+            if (s != address(0) && agentCanSign[s] && agents[s].active) return ERC1271_MAGIC;
+        }
+        return bytes4(0xffffffff);
+    }
+
+    /// EIP-712 types that authorize a value movement — forbidden to agents.
+    function _isValueAuthTypehash(bytes32 t) internal pure returns (bool) {
+        return t == PERMIT_TYPEHASH || t == DAI_PERMIT_TYPEHASH || t == TRANSFER_WITH_AUTH_TYPEHASH
+            || t == RECEIVE_WITH_AUTH_TYPEHASH || t == PERMIT2_TRANSFER_FROM_TYPEHASH || t == PERMIT2_SINGLE_TYPEHASH;
     }
 
     /// 65-byte ECDSA recovery with EIP-2 low-s enforcement. Returns address(0)
