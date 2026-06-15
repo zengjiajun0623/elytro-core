@@ -104,6 +104,7 @@ contract AgentAccount is IAccount {
     bytes4 private constant ERC4626_WITHDRAW_SEL = 0xb460af94; // withdraw(uint256,address,address)
     bytes4 private constant ERC4626_REDEEM_SEL = 0xba087652; // redeem(uint256,address,address)
     bytes4 private constant WETH_WITHDRAW_SEL = 0x2e1a7d4d; // withdraw(uint256)
+    bytes4 private constant ERC777_OPERATOR_SEND_SEL = 0x62ad1b83; // operatorSend(address,address,uint256,bytes,bytes)
     bytes4 private constant ALLOWANCE_SELECTOR = 0xdd62ed3e; // allowance(address,address)
     // Value-authorizing EIP-712 primaryType hashes an agent may NEVER sign (these
     // move value off-chain with no on-chain footprint). Defense-in-depth on top of
@@ -177,6 +178,16 @@ contract AgentAccount is IAccount {
     /// login/session app domains, NEVER a token or Permit2 domain: that is the bound.
     mapping(bytes32 => bool) public approvedSignDomain;
 
+    /// agent => OPEN mode restricted to owner-approved targets. When set alongside
+    /// openMode, the agent may call any selector but ONLY on an openAllowedTarget —
+    /// the recommended way to run open mode against real funds, since it bounds the
+    /// agent's reach away from arbitrary sweep-routers / claim-to-attacker contracts
+    /// (audit 2026-06-15 HIGH-2/HIGH-3). Whole-chain open mode (this false) keeps the
+    /// documented owed-value / standing-allowance residuals.
+    mapping(address => bool) public openModeScoped;
+    /// agent => target => allowed, consulted only when openModeScoped[agent] is true.
+    mapping(address => mapping(address => bool)) public openAllowedTarget;
+
     // ─── Events ─────────────────────────────────────────────────────
 
     event OwnerSet(address indexed previous, address indexed current);
@@ -191,6 +202,8 @@ contract AgentAccount is IAccount {
     event OpenModeSet(address indexed agent, bool on);
     event AgentCanSignSet(address indexed agent, bool on);
     event ApprovedSignDomainSet(bytes32 indexed domainSeparator, bool on);
+    event OpenModeScopedSet(address indexed agent, bool on);
+    event OpenAllowedTargetSet(address indexed agent, address indexed target, bool on);
 
     // ─── Errors ─────────────────────────────────────────────────────
 
@@ -320,6 +333,21 @@ contract AgentAccount is IAccount {
     function setApprovedSignDomain(bytes32 domainSeparator, bool on) external onlyOwnerOrSelf {
         approvedSignDomain[domainSeparator] = on;
         emit ApprovedSignDomainSet(domainSeparator, on);
+    }
+
+    /// Restrict an open-mode agent to owner-approved targets (recommended for real
+    /// funds: bounds its reach away from arbitrary sweep/claim contracts).
+    function setOpenModeScoped(address agent, bool on) external onlyOwnerOrSelf {
+        require(agent != address(0) && agent != owner, "bad agent");
+        openModeScoped[agent] = on;
+        emit OpenModeScopedSet(agent, on);
+    }
+
+    /// Approve a target an open-mode-scoped agent may call (any selector).
+    function setOpenAllowedTarget(address agent, address target, bool on) external onlyOwnerOrSelf {
+        require(target != address(this), "cannot allow self");
+        openAllowedTarget[agent][target] = on;
+        emit OpenAllowedTargetSet(agent, target, on);
     }
 
     function setCap(
@@ -473,8 +501,10 @@ contract AgentAccount is IAccount {
      *      pull is measured as a token outflow and charged against the agent's cap,
      *      so the worst case is unchanged: at most the remaining cap of `token`
      *      leaves. The plain-path approve ban (_isForbiddenSelector) stays intact —
-     *      this is the ONLY route by which an agent allowance exists, and it provably
-     *      leaves none behind.
+     *      this is the ONLY route by which an agent allowance exists. The reset
+     *      leaves none behind UNDER THE ASSUMPTION that the token's allowance() view
+     *      is honest (audit MEDIUM-2) — the same trust class as the realized-value
+     *      balanceOf oracle; JIT therefore requires a protected (owner-vetted) token.
      */
     function executeAsAgentJIT(address spender, address token, uint256 exactAllowance, Call[] calldata calls)
         external
@@ -530,6 +560,12 @@ contract AgentAccount is IAccount {
             // cannot leave unseen. Approvals are unreachable here (forbidden above) and
             // exist only via the reset-guaranteed executeAsAgentJIT rail.
             if (!openMode[agent] && !allowedCall[agent][c.target][sel]) revert CallNotAllowlisted(c.target, sel);
+            // When open mode is TARGET-SCOPED, the agent may use any selector but only
+            // on an owner-approved target — bounding its reach away from arbitrary
+            // sweep-routers / claim-to-attacker contracts (audit HIGH-2/HIGH-3).
+            if (openMode[agent] && openModeScoped[agent] && !openAllowedTarget[agent][c.target]) {
+                revert CallNotAllowlisted(c.target, sel);
+            }
             // An agent may only move tokens it is value-accounted for: a known
             // value-mover selector is permitted only on a PROTECTED token
             // (measured + capped below). Closes value exfiltration through tokens
@@ -625,7 +661,8 @@ contract AgentAccount is IAccount {
             // (each reverts on a non-protected target).
             || sel == SAFE_TRANSFER_FROM_721_SEL || sel == SAFE_TRANSFER_FROM_721_DATA_SEL
             || sel == SAFE_TRANSFER_FROM_1155_SEL || sel == SAFE_BATCH_TRANSFER_1155_SEL
-            || sel == ERC4626_WITHDRAW_SEL || sel == ERC4626_REDEEM_SEL || sel == WETH_WITHDRAW_SEL;
+            || sel == ERC4626_WITHDRAW_SEL || sel == ERC4626_REDEEM_SEL || sel == WETH_WITHDRAW_SEL
+            || sel == ERC777_OPERATOR_SEND_SEL;
     }
 
     /// approve(spender, amount) tolerating non-bool-returning tokens; reverts on
@@ -664,8 +701,11 @@ contract AgentAccount is IAccount {
      *    owner-approved, the type is NOT value-authorizing, and the signer is an
      *    active agent with agentCanSign. So a compromised agent can prove a login on
      *    an approved app but can NEVER produce a value-moving signature: Permit /
-     *    Permit2 / EIP-3009 live on a token/Permit2 domain the owner never approves,
-     *    AND their typehashes are explicitly blocklisted even on an approved domain.
+     *    Permit2 / EIP-3009 live on a token/Permit2 domain the owner never approves
+     *    (the approved-DOMAIN allowlist is the real, load-bearing bound). The
+     *    value-auth typehash blocklist is best-effort defense-in-depth only — it is
+     *    NOT bound to structHash, so a compromised agent can supply a benign typeHash
+     *    over a real Permit structHash and slip it; do not rely on it (audit MEDIUM-1).
      *    Opaque personal_sign / eth_sign (a bare 65-byte sig) stays OWNER-ONLY,
      *    because its preimage cannot be inspected on-chain.
      */

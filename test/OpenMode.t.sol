@@ -209,4 +209,46 @@ contract OpenModeTest is Test {
         vm.expectRevert(abi.encodeWithSelector(AgentAccount.ApproveResetFailed.selector, address(usdc), address(router)));
         account.executeAsAgentJIT(address(router), address(usdc), 1e18, calls);
     }
+
+    // ── audit 2026-06-15 fixes ───────────────────────────────────
+
+    /// HIGH-2 partial: ERC-777 operatorSend is now a recognized value-mover, so it
+    /// reverts on a non-protected token (closes the direct-held redirect leak).
+    function test_OpenMode_ERC777OperatorSendOnUnprotectedReverts() public {
+        _open();
+        bytes memory data = abi.encodeWithSelector(bytes4(0x62ad1b83), address(account), attacker, uint256(1e18), bytes(""), bytes(""));
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(AgentAccount.UnprotectedTokenTransfer.selector, address(weth)));
+        account.executeAsAgent(_one(address(weth), 0, data));
+    }
+
+    /// HIGH-3 mitigation: target-scoped open mode bounds the agent's reach to
+    /// owner-approved targets (so it cannot reach an arbitrary sweep router).
+    function test_OpenModeScoped_RestrictsToApprovedTargets() public {
+        _open();
+        vm.startPrank(owner);
+        account.setOpenModeScoped(agent, true);
+        account.setOpenAllowedTarget(agent, address(sink), true);
+        vm.stopPrank();
+
+        // approved target → allowed
+        vm.prank(agent);
+        account.executeAsAgent(_one(address(sink), 0, abi.encodeWithSelector(Sink.ping.selector)));
+
+        // any other target → refused, even in open mode
+        vm.prank(agent);
+        vm.expectRevert(
+            abi.encodeWithSelector(AgentAccount.CallNotAllowlisted.selector, address(router), PullSwapRouter.swap.selector)
+        );
+        account.executeAsAgent(_one(address(router), 0, abi.encodeWithSelector(PullSwapRouter.swap.selector, 1e18)));
+    }
+
+    function test_OpenModeScopedControls_OwnerOnly() public {
+        vm.prank(agent);
+        vm.expectRevert(AgentAccount.NotOwnerOrSelf.selector);
+        account.setOpenModeScoped(agent, true);
+        vm.prank(agent);
+        vm.expectRevert(AgentAccount.NotOwnerOrSelf.selector);
+        account.setOpenAllowedTarget(agent, address(sink), true);
+    }
 }

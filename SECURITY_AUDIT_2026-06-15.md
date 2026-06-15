@@ -6,6 +6,20 @@ I've verified the findings against the actual code and test suite. Here is the a
 
 ---
 
+## RESOLUTION STATUS — updated 2026-06-15 (post-audit fixes)
+
+| Finding | Status |
+|---|---|
+| **HIGH-1** native prefund drain | **FIXED** — agent gas prefund is charged against the native cap in `validateUserOp` (reverts if uncapped/over-cap); owner unbounded. 4 regression tests; full suite green. |
+| **HIGH-2** owed-value redirect | **PARTIALLY FIXED** — ERC-777 `operatorSend` added to the measured value-mover set; **target-scoped open mode** added to bound the agent's reach; invariant copy corrected to "bounds HELD assets, not OWED value". Residual (`claim`/`getReward`/`withdrawTo` to an attacker on an *approved* protocol) is structural to balance-based accounting — full closure needs per-protocol `recipient == self` pinning when real protocols are wired in. |
+| **HIGH-3** standing-allowance sweep | **MITIGATED** — target-scoped open mode (`setOpenModeScoped` + `setOpenAllowedTarget`) bounds the agent to vetted targets, so it cannot reach an arbitrary sweep-router; docstring corrected. Operational precondition for *whole-chain* open mode remains: enable only when every held/approved token is protected. |
+| **MEDIUM-1** 1271 typehash decorative | **DOC-CORRECTED** — the approved-DOMAIN allowlist is stated as the load-bearing bound; the typehash blocklist is labelled best-effort defense-in-depth (not bound to structHash). The CLI refuses to *produce* a value-auth signature. |
+| **MEDIUM-2** JIT trusts `allowance()` | **DOC-CORRECTED** — the reset-assert is sound under an honest `allowance()` view (same trust class as the `balanceOf` oracle); JIT requires a protected (vetted) token. |
+
+Full suite after fixes: **96 pass / 0 fail / 1 skipped.**
+
+---
+
 # elytro-core Security Audit — Agent-Native Smart Account (`AgentAccount.sol`)
 
 **Date:** 2026-06-15 · **Scope:** `src/AgentAccount.sol`, the ERC-4337 paths, the ERC-1271 bounded-signing surface, and the `cli/elytro.ts` driver. **Threat model audited:** the one the contract states — the agent key is compromised; the owner (cold key) and the EntryPoint are honest.
