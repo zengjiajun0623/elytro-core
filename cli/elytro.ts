@@ -24,6 +24,10 @@ import {
   toBytes,
   isAddress,
   getAddress,
+  hashDomain,
+  hashStruct,
+  getTypesForEIP712Domain,
+  encodeAbiParameters,
   BaseError,
   ContractFunctionRevertedError,
   type Address,
@@ -786,7 +790,8 @@ type Routed =
   | { kind: 'reply'; result: unknown }
   | { kind: 'escalate'; reason: string }
   | { kind: 'tx'; calls: RoutedCall[] }
-  | { kind: 'jit'; spender: Address; token: Address; amount: bigint; calls: RoutedCall[] };
+  | { kind: 'jit'; spender: Address; token: Address; amount: bigint; calls: RoutedCall[] }
+  | { kind: 'sign'; typedData: any };
 
 function routeWcRequest(method: string, params: any[], account: Address, chainId: number): Routed {
   const norm = (c: any): RoutedCall => ({ target: getAddress(c.to), value: BigInt(c.value ?? 0), data: (c.data ?? '0x') as Hex });
@@ -798,9 +803,12 @@ function routeWcRequest(method: string, params: any[], account: Address, chainId
       return { kind: 'reply', result: '0x' + chainId.toString(16) };
     case 'personal_sign':
     case 'eth_sign':
+      return { kind: 'escalate', reason: `personal_sign requires the owner (opaque preimage; only EIP-712 typed-data is bounded-signable)` };
     case 'eth_signTypedData':
-    case 'eth_signTypedData_v4':
-      return { kind: 'escalate', reason: `signing (${method}) requires the owner until bounded login-signing ships` };
+    case 'eth_signTypedData_v4': {
+      const raw = params?.[1];
+      return { kind: 'sign', typedData: typeof raw === 'string' ? JSON.parse(raw) : raw };
+    }
     case 'eth_sendTransaction': {
       const tx = params?.[0] ?? {};
       const sel = selectorOf(tx.data);
@@ -844,6 +852,92 @@ async function simulateRouted(c: ReturnType<typeof cfg>, acct: Address, agentAdd
   }
 }
 
+// ─── EIP-712 bounded agent login signing ─────────────────────────
+const SIGNING_ABI = [
+  { type: 'function', name: 'approvedSignDomain', stateMutability: 'view', inputs: [{ type: 'bytes32' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'agentCanSign', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'setApprovedSignDomain', stateMutability: 'nonpayable', inputs: [{ type: 'bytes32' }, { type: 'bool' }], outputs: [] },
+  { type: 'function', name: 'setAgentCanSign', stateMutability: 'nonpayable', inputs: [{ type: 'address' }, { type: 'bool' }], outputs: [] },
+] as const;
+// Value-authorizing EIP-712 types the agent may never sign (mirrors the contract).
+const VALUE_AUTH_TYPEHASHES = new Set<string>([
+  keccak256(toBytes('Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)')),
+  keccak256(toBytes('Permit(address holder,address spender,uint256 nonce,uint256 expiry,bool allowed)')),
+  keccak256(toBytes('TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)')),
+  keccak256(toBytes('ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)')),
+  keccak256(toBytes('PermitTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline)TokenPermissions(address token,uint256 amount)')),
+  keccak256(toBytes('PermitSingle(PermitDetails details,address spender,uint256 sigDeadline)PermitDetails(address token,uint160 amount,uint48 expiration,uint48 nonce)')),
+]);
+/// EIP-712 encodeType for primaryType, including sorted referenced struct types.
+function encodeType(primaryType: string, types: Record<string, { name: string; type: string }[]>): string {
+  const deps = new Set<string>();
+  const visit = (t: string) => {
+    if (deps.has(t) || !types[t]) return;
+    deps.add(t);
+    for (const f of types[t]) { const base = f.type.replace(/\[.*$/, ''); if (types[base]) visit(base); }
+  };
+  visit(primaryType);
+  deps.delete(primaryType);
+  const ordered = [primaryType, ...Array.from(deps).sort()];
+  return ordered.map((t) => `${t}(${types[t].map((f) => `${f.type} ${f.name}`).join(',')})`).join('');
+}
+/// Build the bounded agent signature blob: abi.encode(domainSeparator, structHash,
+/// primaryTypeHash, 65-byte sig) over the EIP-712 digest of `typedData`.
+async function buildSignBlob(typedData: any, agent: ReturnType<typeof agentAccount>) {
+  const domain = typedData.domain ?? {};
+  const baseTypes = typedData.types ?? {};
+  const primaryType: string = typedData.primaryType;
+  // viem's hashDomain/hashStruct want EIP712Domain present in the types map.
+  const types = { EIP712Domain: getTypesForEIP712Domain({ domain }), ...baseTypes };
+  const domSep = hashDomain({ domain, types });
+  const structHash = hashStruct({ primaryType, data: typedData.message, types });
+  const typeHash = keccak256(toBytes(encodeType(primaryType, baseTypes)));
+  const digest = keccak256(('0x1901' + domSep.slice(2) + structHash.slice(2)) as Hex);
+  const sig = await agent.sign({ hash: digest });
+  const blob = encodeAbiParameters(
+    [{ type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes' }],
+    [domSep, structHash, typeHash, sig],
+  );
+  return { domSep, structHash, typeHash, digest, blob, isValueAuth: VALUE_AUTH_TYPEHASHES.has(typeHash) };
+}
+/// Would the account accept this agent signature? (value-auth refused; domain must
+/// be owner-approved; agentCanSign must be on). Mirrors the on-chain isValidSignature.
+async function evalSign(c: ReturnType<typeof cfg>, acct: Address, agentAddr: Address, built: Awaited<ReturnType<typeof buildSignBlob>>) {
+  const [domApproved, canSign] = await Promise.all([
+    c.pub.readContract({ address: acct, abi: SIGNING_ABI, functionName: 'approvedSignDomain', args: [built.domSep] }) as Promise<boolean>,
+    c.pub.readContract({ address: acct, abi: SIGNING_ABI, functionName: 'agentCanSign', args: [agentAddr] }) as Promise<boolean>,
+  ]);
+  const reason = built.isValueAuth ? 'value-authorizing type refused' : !domApproved ? 'domain not approved' : !canSign ? 'agentCanSign off' : null;
+  return { accept: reason === null, reason };
+}
+
+// sign: produce a BOUNDED agent ERC-1271 login signature for EIP-712 typed data.
+// The account validates it only on owner-approved domains and never a value type.
+common(program.command('sign'))
+  .description('Produce a bounded agent EIP-712 login signature (account-validated on approved domains)')
+  .requiredOption('--account <addr>')
+  .requiredOption('--typed-data <json>', 'EIP-712 typed data {domain,types,primaryType,message}')
+  .action(async (o) => {
+    const c = cfg(o);
+    const acct = getAddress(o.account!);
+    const agent = agentAccount(o);
+    let td: any;
+    try { td = JSON.parse(o.typedData!); } catch { fail(-32602, 'bad --typed-data JSON'); }
+    const built = await buildSignBlob(td, agent);
+    const [domainApproved, canSign] = await Promise.all([
+      c.pub.readContract({ address: acct, abi: SIGNING_ABI, functionName: 'approvedSignDomain', args: [built.domSep] }) as Promise<boolean>,
+      c.pub.readContract({ address: acct, abi: SIGNING_ABI, functionName: 'agentCanSign', args: [agent.address] }) as Promise<boolean>,
+    ]);
+    if (built.isValueAuth) fail(-32010, 'Refused: value-authorizing typed data (Permit/Permit2/EIP-3009) cannot be signed by the agent.', { decision: 'escalate', domSep: built.domSep, typeHash: built.typeHash });
+    if (!domainApproved) fail(-32010, 'Refused: domain not approved for agent signing. Ask the owner to setApprovedSignDomain for this app.', { decision: 'escalate', domSep: built.domSep });
+    if (!canSign) fail(-32010, 'Refused: agentCanSign is off for this agent. Ask the owner to enable it.', { decision: 'escalate' });
+    ok({
+      account: acct, agent: agent.address, domSep: built.domSep, typeHash: built.typeHash, digest: built.digest,
+      signature: built.blob, accepted: true,
+      note: 'Bounded agent login signature; the account isValidSignature accepts it on this approved domain.',
+    });
+  });
+
 // connect: WalletConnect bridge. --simulate-request tests routing with no relay;
 // a wc: URI pairs live (needs WC_PROJECT_ID + the @reown/walletkit dep).
 common(program.command('connect'))
@@ -864,6 +958,12 @@ common(program.command('connect'))
       const routed = routeWcRequest(reqObj.method, reqObj.params ?? [], acct, c.chain.id);
       if (routed.kind === 'reply') ok({ request: reqObj.method, routed: 'reply', result: routed.result });
       if (routed.kind === 'escalate') ok({ request: reqObj.method, routed: 'escalate', decision: 'escalate', reason: routed.reason });
+      if (routed.kind === 'sign') {
+        const built = await buildSignBlob(routed.typedData, agent);
+        const ev = await evalSign(c, acct, agent.address, built);
+        ok({ request: reqObj.method, routed: 'sign', decision: ev.accept ? 'allow' : 'escalate', domSep: built.domSep, accepted: ev.accept, reason: ev.reason ?? undefined,
+          note: ev.accept ? 'Would return a bounded agent login signature for this approved domain.' : 'Signing refused; escalate to owner.' });
+      }
       const sim = await simulateRouted(c, acct, agent.address, routed);
       ok({
         request: reqObj.method, routed: routed.kind, decision: sim.decision, predictedError: sim.predictedError,
@@ -919,6 +1019,13 @@ common(program.command('connect'))
       try {
         if (routed.kind === 'reply') return respond(routed.result);
         if (routed.kind === 'escalate') { process.stderr.write(JSON.stringify({ event: 'escalate', method, reason: routed.reason }) + '\n'); return reject(routed.reason); }
+        if (routed.kind === 'sign') {
+          const built = await buildSignBlob(routed.typedData, agent);
+          const ev = await evalSign(c, acct, agent.address, built);
+          if (!ev.accept) { process.stderr.write(JSON.stringify({ event: 'sign_escalate', reason: ev.reason }) + '\n'); return reject(`signing refused: ${ev.reason}`); }
+          process.stderr.write(JSON.stringify({ event: 'signed', domSep: built.domSep }) + '\n');
+          return respond(built.blob);
+        }
         const sim = await simulateRouted(c, acct, agent.address, routed);
         if (sim.decision === 'block') { process.stderr.write(JSON.stringify({ event: 'refused', method, predictedError: sim.predictedError }) + '\n'); return reject(`refused on cap/policy: ${sim.predictedError}`); }
         const fn = routed.kind === 'jit' ? 'executeAsAgentJIT' : 'executeAsAgent';
